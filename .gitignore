@@ -12,6 +12,9 @@ __pycache__/
 # Data
 data/
 
+# Results
+results/
+
 # OS files
 .DS_Store
 Thumbs.db
