@@ -37,10 +37,11 @@ library(mutoss)
 library(clue)
 library(cluster) # for kmedoids
 library(concaveman)
-library(factoextra)
+#library(factoextra)
 library(fmsb) # for radar plot
 ```
 # Custom functions
+## HMM fitting
 
 ```{r}
 # ---- Helper functions (HMM fitting + summaries) ----
@@ -90,13 +91,7 @@ extract_state_means <- function(model) {
   })
 }
 ```
-```{r}
-# Compute similarity (correlation) between two state-mean matrices.
-# Returns a K x K matrix: correlations between states in mat1 vs states in mat2.
-state_similarity <- function(mat1, mat2) {
-  stats::cor(mat1, mat2)
-}
-```
+
 ```{r}
 # Solve best one-to-one state matching using the Hungarian algorithm.
 # Input: similarity matrix (K x K). Output: assignment vector of length K,
@@ -241,7 +236,7 @@ results_path <- file.path(dirname(getwd()), "results")
 
 ```{r}
 component_cols <- c("Component_1", "Component_2", "Component_3", "Component_4", "Component_5")
-esm_traits_z <- esm_traits %>%
+esm_traits_z <- esm_traits |>
   mutate(across(
     all_of(component_cols),
     ~ (.x - mean(.x, na.rm = TRUE)) / sd(.x, na.rm = TRUE),
@@ -270,15 +265,15 @@ parameters::parameters(affective_test)
 # Establish default thought patterns: calculate for each participant the geometric median of their observations
 
 ```{r}
-centroid_summary <- esm_traits_z %>%
-  filter(Stimulus_Type == "Baseline") %>%
-  dplyr::select(ID, Component_1_z:Component_5_z) %>%
-  group_by(ID) %>%
-  group_split() %>%
+centroid_summary <- esm_traits_z |>
+  filter(Stimulus_Type == "Baseline") |>
+  dplyr::select(ID, Component_1_z:Component_5_z) |>
+  group_by(ID) |>
+  group_split() |>
   map_dfr(function(df) {
-    comp_matrix <- df %>%
-      dplyr::select(Component_1_z:Component_5_z) %>%
-      drop_na() %>%
+    comp_matrix <- df |>
+      dplyr::select(Component_1_z:Component_5_z) |>
+      drop_na() |>
       as.matrix()
     geom_vec   <- geo_median(comp_matrix)$p  
     tibble(
@@ -296,15 +291,15 @@ esm_centroids <- esm_traits_z |>
 
 ```{r}
 # Calculate the distance for each observation to the geometric median
-esm_centroids <- esm_centroids %>%
-  rowwise() %>%
+esm_centroids <- esm_centroids |>
+  rowwise() |>
   mutate(
     Radius_geom = {
       comps <- c_across(Component_1_z:Component_5_z)
       geom_cent <- c_across(Geom_1:Geom_5)
       sqrt(sum((comps - geom_cent)^2))
     }
-  ) %>%
+  ) |>
   ungroup() |>
   mutate(AGE_stnd = scale(AGE), 
          GENDER = as_factor(GENDER))
@@ -325,8 +320,8 @@ within_similarity_df <- data.frame(ID = character(), within_similarity_z = numer
 # Loop over each participant ID
 for (id in participant_ids) {
   # Subset data for the current participant
-  participant_data <- esm_traits_base %>%
-    dplyr::filter(ID == id) %>%
+  participant_data <- esm_traits_base |>
+    dplyr::filter(ID == id) |>
     dplyr::select(c("Component_1_z":"Component_5_z"))
   # Convert to matrix
   participant_matrix <- as.matrix(participant_data)
@@ -350,9 +345,9 @@ mean_within_similarity <- mean(within_similarity_df$within_similarity_z)
 
 ```{r}
 # Between subject similarity
-mean_vectors <- esm_traits_base %>%
-  group_by(ID) %>%
-  summarise(across(c("Component_1_z":"Component_5_z"), \(x) mean(x, na.rm = TRUE))) %>%
+mean_vectors <- esm_traits_base |>
+  group_by(ID) |>
+  summarise(across(c("Component_1_z":"Component_5_z"), \(x) mean(x, na.rm = TRUE))) |>
   ungroup()
 mean_matrix <- as.matrix(mean_vectors[, -1])
 ```
@@ -452,7 +447,7 @@ permutation_plot <- ggplot(perm_df, aes(x = perm_diff)) +
 dep_c1_lm <- lmerTest::lmer(Component_1_z ~ CESD_stnd + AGE + GENDER + (1|ID), data = esm_traits_base)
 anova_c1<- car::Anova(dep_c1_lm, type = 3, test.statistic = "F") |> 
   as.data.frame()
-anova_tbl <- anova_c1 %>%
+anova_tbl <- anova_c1 |>
   rownames_to_column(var = "term")
 anova_c1
 ```
@@ -548,34 +543,34 @@ esm_traits_base <- esm_traits_base |>
 
 ```{r}
 # Categorise depression into Yes or No based on questionnaire threshold
-esm_traits_base <- esm_traits_base %>%
+esm_traits_base <- esm_traits_base |>
   mutate(CESD_th = ifelse(CESD >= 16, "Yes", "No"))
 ```
 
 ```{r}
 # Calculate proportion of High and Low Negative Intrusive Thought
-participant_counts <- esm_traits_base %>%
-  group_by(ID, C1_prop, CESD_th) %>%
-  summarise(n = n(), .groups = "drop") %>%
+participant_counts <- esm_traits_base |>
+  group_by(ID, C1_prop, CESD_th) |>
+  summarise(n = n(), .groups = "drop") |>
   complete(ID, C1_prop, fill = list(n = 0)) |>
   group_by(ID) |>
   tidyr::fill(CESD_th, .direction = "downup") |>
-  mutate(prop = n / sum(n)) %>%
+  mutate(prop = n / sum(n)) |>
   ungroup() 
 ```
 
 ### Model
 
 ```{r}
-esm_binomial <- esm_traits_base %>%
-  group_by(ID) %>%
+esm_binomial <- esm_traits_base |>
+  group_by(ID) |>
   summarise(
     high = sum(C1_prop == "High", na.rm = TRUE),
     total = n(),
     CESD_stnd = first(CESD_stnd),
     AGE = first(AGE),
     GENDER = first(GENDER)
-  ) %>%
+  ) |>
   mutate(low = total - high)
 ```
 
@@ -629,7 +624,7 @@ esm_hmm <- esm_centroids |>
 K_values <- 2:5
 seeds    <- 1:20
 
-results <- expand.grid(K = K_values, seed = seeds) %>%
+results <- expand.grid(K = K_values, seed = seeds) |>
   mutate(
     # fit_hmm(data, K, seed) returns a fitted model or NULL if fitting fails
     model = map2(K, seed, ~ fit_hmm(data = esm_hmm, K = .x, seed = .y)),
@@ -806,8 +801,8 @@ ggsave(
 
 ```{r}
 # Compute switching rate for each state per participant
-switching_df <- esm_hmm %>%
-  group_by(ID) %>%
+switching_df <- esm_hmm |>
+  group_by(ID) |>
   summarise(switch_rate = switching_rate(State), .groups = "drop") |>
   left_join(cesd_by_id, by = "ID") |>
   mutate(
@@ -815,14 +810,19 @@ switching_df <- esm_hmm %>%
     GENDER = forcats::as_factor(GENDER),
   )
 
-switching_counts <- esm_hmm %>%        
-  group_by(ID) %>%
+# Counts-based switching variables:
+#   total_transitions = N-1
+#   n_switches       = number of times State[t] != State[t-1]
+switching_counts <- esm_hmm |>        
+  group_by(ID) |>
   dplyr::summarise(
-    total_transitions = n() - 1,    # number of transitions = observations − 1
-    n_switches = sum(diff(State) != 0),  # number of times state changes
-    switch_rate = n_switches / total_transitions,  # optional check
-  ) %>%
-  ungroup() |> 
+    total_transitions = n() - 1,    
+    n_switches = sum(diff(State) != 0),  
+    switch_rate       = ifelse(total_transitions > 0,
+                              n_switches / total_transitions,
+                              NA_real_),
+    .groups = "drop"
+  ) |> 
   left_join(cesd_by_id, by = "ID") |>
   mutate(
     AGE_stnd = scale(AGE),             
@@ -831,11 +831,11 @@ switching_counts <- esm_hmm %>%
 ```
 
 ```{r}
-# Fit model of switching rates from depression age and gender
+# Fit model of switching as binomial from depression age and gender
 switch_binomial <- glm(
   cbind(n_switches, total_transitions - n_switches) ~ CESD_stnd + AGE_stnd + GENDER,
   data = switching_counts,
-  family = binomial
+  family = binomial()
 )
 
 summary(switch_binomial)
@@ -851,39 +851,45 @@ n_states <- length(unique(esm_hmm$State))
 
 ```{r}
 # Compute TPMs per participant (with self transitions)
-participant_tpms <- esm_hmm %>%
-  group_by(ID) %>%
-  group_split() %>%
+participant_tpms <- esm_hmm |>
+  group_by(ID) |>
+  group_split() |>
   map(~ compute_tpm(.x$State, n_states))
 ```
 ```{r}
 # Name each matrix by participant ID
 names(participant_tpms) <- unique(esm_hmm$ID)
 
-tpm_long_df <- map2_dfr(participant_tpms, names(participant_tpms), function(mat, id) {
-  as_tibble(mat, .name_repair = "minimal") %>%
-    mutate(from = rownames(mat), ID = id) %>%
-    pivot_longer(cols = starts_with("S"), names_to = "to", values_to = "prob")
-})
+tpm_long_df <- map2_dfr(
+  participant_tpms, 
+  names(participant_tpms), 
+  function(mat, id) {
+  as_tibble(mat, .name_repair = "minimal") |>
+    mutate(from = rownames(mat), ID = id) |>
+    pivot_longer(
+      cols = starts_with("S"), 
+      names_to = "to", 
+      values_to = "prob"
+      )
+    }
+  )
 
 # Join TMP to depression and demographic data
-tpm_with_cesd <- tpm_long_df %>%
+tpm_with_cesd <- tpm_long_df |>
   left_join(cesd_by_id, by = "ID") |>
   mutate(
     AGE_stnd = scale(AGE),        
     GENDER = forcats::as_factor(GENDER),
   )
 
-# Create symmetrical matrix 
-tpm_sym <- tpm_with_cesd %>%  
+# Collapse (from,to) and (to,from) into one undirected pair label
+tpm_pair_avg <- tpm_with_cesd |>  
   mutate(
     pair = ifelse(from < to,
                   paste0(from, "_", to),
                   paste0(to, "_", from))
-  )
-
-tpm_pair_avg <- tpm_sym %>%
-  group_by(ID, pair) %>%
+  ) |>
+  group_by(ID, pair) |>
   summarise(
     prob_avg = mean(prob, na.rm = TRUE),
     CESD_stnd = first(CESD_stnd),
@@ -895,66 +901,62 @@ tpm_pair_avg <- tpm_sym %>%
 
 ```{r}
 # Fit a model for each from to transition pair, correct for multiple comparisons
-transition_sym_stats <- tpm_pair_avg %>%
-  group_by(pair) %>%
-  nest() %>%
+transition_sym_stats <- tpm_pair_avg |>
+  group_by(pair) |>
+  nest() |>
   mutate(
     model = map(data, ~ lm(prob_avg ~ CESD_stnd + AGE_stnd + GENDER, data = .x)),
     tidy  = map(model, ~ broom::tidy(.x, conf.int = TRUE))
-  ) %>%
-  unnest(tidy) %>%
+  ) |>
+  unnest(tidy) |>
   group_by(term) |>
   mutate(p_fdr = p.adjust(p.value, method = "fdr")) |>
-  ungroup() %>%
+  ungroup() |>
   mutate(across(where(is.numeric), ~ round(.x, 3)))
 ```
 
 ```{r}
 # Compute secondary TPM per participant (without self-transitions)
-participant_tpms_secondary <- esm_hmm %>%
-  group_by(ID) %>%
-  group_split() %>%
-  map(~ compute_tpm_secondary(.x$State, n_states))
+participant_tpms_no_self <- esm_hmm |>
+  group_by(ID) |>
+  group_split() |>
+  map(~ compute_tpm_no_self(.x$State, n_states))
 ```
 
 ```{r}
 # Name each matrix by participant ID
-names(participant_tpms_secondary) <- unique(esm_hmm$ID)
+names(participant_tpms_no_self) <- unique(esm_hmm$ID)
 ```
 
 ```{r}
 # Convert to long df for analysis
-tpm_secondary_long <- map2_dfr(participant_tpms_secondary,
-                               names(participant_tpms_secondary),
-                               function(mat, id) {
-                                 as_tibble(mat, .name_repair = "minimal") %>%
-                                   mutate(from = rownames(mat), ID = id) %>%
-                                   pivot_longer(cols = starts_with("S"),
-                                                names_to = "to",
-                                                values_to = "prob")
-                               })
-```
-
-```{r}
-# Add CESD scores
-tpm_secondary_long <- tpm_secondary_long %>%
+tpm_no_self_long <- map2_dfr(
+  participant_tpms_no_self,
+  names(participant_tpms_no_self),
+  function(mat, id) {
+    as_tibble(mat, .name_repair = "minimal") |>
+      mutate(from = rownames(mat), ID = id) |>
+      pivot_longer(cols = starts_with("S"),
+                   names_to = "to",
+                   values_to = "prob")
+    }) |>
   left_join(cesd_by_id, by = "ID") |>
   mutate(
     AGE_stnd = scale(AGE),             
     GENDER = forcats::as_factor(GENDER),
   )
+```
 
+```{r}
 # Compute symmetrical matrix of transitions
-tpm_sym_sec <- tpm_secondary_long %>%
-  filter(from != to) %>%    
+tpm_pair_no_self <- tpm_no_self_long |>
+  filter(from != to) |>    
   mutate(
     pair = ifelse(from < to,
                   paste0(from, "_", to),
                   paste0(to, "_", from))
-  )
-
-tpm_pair_sec <- tpm_sym_sec %>%
-  group_by(ID, pair) %>%
+  ) |>
+  group_by(ID, pair) |>
   summarise(
     prob_avg = mean(prob, na.rm = TRUE),
     CESD_stnd = first(CESD_stnd),
@@ -966,52 +968,52 @@ tpm_pair_sec <- tpm_sym_sec %>%
 
 ```{r}
 # Fit a model for each transition pair, correct for multiple comparisons
-transition_sym_stats_sec <- tpm_pair_sec %>%
-  group_by(pair) %>%
-  nest() %>%
+transition_sym_stats_no_self <- tpm_pair_no_self |>
+  group_by(pair) |>
+  nest() |>
   mutate(
     model = map(data, ~ lm(prob_avg ~ CESD_stnd + AGE_stnd + GENDER, data = .x)),
     tidy  = map(model, ~ broom::tidy(.x, conf.int = TRUE))
-  ) %>%
-  unnest(tidy) %>%
+  ) |>
+  unnest(tidy) |>
   group_by(term) |>
   mutate(p_fdr = p.adjust(p.value, method = "fdr")) |>
-  ungroup() %>%
+  ungroup() |>
   mutate(across(where(is.numeric), ~ round(.x, 3)))
 ```
 
 ```{r}
 # Compute fractional occupancy per participant × state
-fractional_occupancy <- esm_hmm %>%
-  group_by(ID, State) %>%
-  summarise(n_timepoints = n(), .groups = "drop") %>%
-  group_by(ID) %>%
-  mutate(FO = n_timepoints / sum(n_timepoints)) %>%
-  ungroup() %>%
-  complete(ID, State, fill = list(FO = 0, n_timepoints = 0)) %>%
+fractional_occupancy <- esm_hmm |>
+  group_by(ID, State) |>
+  summarise(n_timepoints = n(), .groups = "drop") |>
+  group_by(ID) |>
+  mutate(FO = n_timepoints / sum(n_timepoints)) |>
+  ungroup() |>
+  complete(ID, State, fill = list(FO = 0, n_timepoints = 0)) |>
   left_join(cesd_by_id, by = "ID") |>
   mutate(
     AGE_stnd = scale(AGE),            
-    GENDER = forcats::as_factor(GENDER),
+    GENDER = forcats::as_factor(GENDER)
   )
 ```
 
 ```{r}
 # Fit a model for each state, correct for multiple comparisons
-fo_beta_results <- fractional_occupancy %>%
-  group_by(State) %>%
-  nest() %>%
+fo_beta_results <- fractional_occupancy |>
+  group_by(State) |>
+  nest() |>
   mutate(
     model = map(data, ~ glmmTMB(FO ~ CESD_stnd ,
                                 data = .x,
                                 family = ordbeta(link = "logit"))),
     tidy = map(model, ~ broom.mixed::tidy(.x, conf.int = TRUE))
-  ) %>%
-  unnest(tidy) %>%
-  mutate(term = as.character(term)) %>%
-  # --- NEW: apply FDR correction ---
-  group_by(term) %>%
-  mutate(p_adj_fdr = p.adjust(p.value, method = "fdr")) %>%
+  ) |>
+  unnest(tidy) |>
+  mutate(term = as.character(term)) |>
+  group_by(term) |>
+  mutate(p_adj_fdr = p.adjust(p.value, method = "fdr")) |>
+  ungroup() |>
   mutate(across(where(is.numeric), ~ round(.x, 4)))
 ```
 
@@ -1110,9 +1112,9 @@ pairs <- combn(geom_vars, 2, simplify = FALSE)
 #   y_var <- pair[2]
 #   x_lab <- get_label(x_var)
 #   y_lab <- get_label(y_var)
-#   cluster_hulls <- centroid_dep %>%
-#     filter(cluster_med %in% c(1,2)) %>%
-#     group_by(cluster_med) %>%
+#   cluster_hulls <- centroid_dep |>
+#     filter(cluster_med %in% c(1,2)) |>
+#     group_by(cluster_med) |>
 #     do({
 #       # extract numeric matrix (NO tibble)
 #       pts <- as.matrix(select(., Geom_1, Geom_2, Geom_3, Geom_4, Geom_5))
@@ -1125,7 +1127,7 @@ pairs <- combn(geom_vars, 2, simplify = FALSE)
 #       names(hull_df) <- c("Geom_1", "Geom_2", "Geom_3", "Geom_4", "Geom_5")
 #       hull_df$cluster_med <- unique(.$cluster_med)
 #       hull_df
-#     }) %>%
+#     }) |>
 #     ungroup()
 #   
 #   # Build plot
@@ -1144,7 +1146,7 @@ pairs <- combn(geom_vars, 2, simplify = FALSE)
 #     scale_color_brewer(palette = "Dark2", guide = "none") +
 #     ggnewscale::new_scale_color() +
 #     geom_point(
-#       data = centroid_dep %>% filter(cluster_med %in% c(1,2)),
+#       data = centroid_dep |> filter(cluster_med %in% c(1,2)),
 #       aes(x = .data[[x_var]], y = .data[[y_var]], color = CESD_stnd),
 #       size = 2, alpha = 0.8
 #     ) +
@@ -1308,9 +1310,9 @@ divergence_by_component <- tibble(
   Component  = names(means),
   Mean_Diff  = means,
   Std_Diff   = sds
-) %>%
-  left_join(t_res %>% dplyr::select(Component, statistic, p.value), by = "Component") %>%
-  rename(t_value = statistic, p_value = p.value) %>%
+) |>
+  left_join(t_res |> dplyr::select(Component, statistic, p.value), by = "Component") |>
+  rename(t_value = statistic, p_value = p.value) |>
   arrange(p_value) 
 ```
 
@@ -1528,7 +1530,7 @@ range(rr_days$n_days)
 ```
 
 ```{r}
-prop_6days <- rr_days %>%
+prop_6days <- rr_days |>
   summarise(
     total_participants = n(),
     at_least_6_days = sum(n_days >= 6),
@@ -1579,7 +1581,7 @@ flextable::save_as_rtf(flextable_summary, path = file.path(results_path,"distr_t
 ```
 
 ```{r}
-participant_counts_only <- participant_counts %>%
+participant_counts_only <- participant_counts |>
   left_join(cesd_by_id, by = "ID")|>
   mutate(CESD_th = forcats::fct_relevel(CESD_th, "No", "Yes"),
          C1_prop = forcats::fct_relevel(C1_prop, "Low", "High"),
@@ -1588,21 +1590,21 @@ participant_counts_only <- participant_counts %>%
 
 ```{r}
 # 1. Count unique participants per group
-counts_wide <- participant_counts_only %>%
-  dplyr::distinct(ID, CESD_th) %>%
-  dplyr::count(CESD_th) %>%
+counts_wide <- participant_counts_only |>
+  dplyr::distinct(ID, CESD_th) |>
+  dplyr::count(CESD_th) |>
   tidyr::pivot_wider(
     names_from  = CESD_th,
     values_from = n,
     names_prefix = "n_"
-  ) %>%
+  ) |>
   mutate(n_Overall = n_No + n_Yes)
 ```
 
 ```{r}
 # 2. Get CESD summary stats
-cesd_summary <- participant_counts_only %>%
-  distinct(ID, CESD, CESD_th) %>%
+cesd_summary <- participant_counts_only |>
+  distinct(ID, CESD, CESD_th) |>
   summarise(
     CESD_Overall_Mean = mean(CESD, na.rm = TRUE),
     CESD_Overall_SD   = sd(CESD, na.rm = TRUE),
@@ -1615,8 +1617,8 @@ cesd_summary <- participant_counts_only %>%
 
 ```{r}
 # 3. Proportion summary per C1_prop level
-prop_summary <- participant_counts_only %>%
-  group_by(C1_prop) %>%
+prop_summary <- participant_counts_only |>
+  group_by(C1_prop) |>
   summarise(
     mean_Overall = mean(prop, na.rm = TRUE),
     mean_No      = mean(prop[CESD_th == "No"],  na.rm = TRUE),
@@ -1627,11 +1629,11 @@ prop_summary <- participant_counts_only %>%
 
 ```{r}
 # 1. CESD summary — reshape to match structure
-cesd_summary_long <- cesd_summary %>%
+cesd_summary_long <- cesd_summary |>
   mutate(
     Measure        = "CESD",
     C1_prop_Level  = ""
-  ) %>%
+  ) |>
   dplyr::select(
     Measure, C1_prop_Level,
     Overall = CESD_Overall_Mean,
@@ -1642,11 +1644,11 @@ cesd_summary_long <- cesd_summary %>%
 
 ```{r}
 # 2. prop_summary — reshape to same format
-prop_summary_long <- prop_summary %>%
+prop_summary_long <- prop_summary |>
   mutate(
     Measure = "C1_prop"
-  ) %>%
-  rename(C1_prop_Level = C1_prop) %>%
+  ) |>
+  rename(C1_prop_Level = C1_prop) |>
   dplyr::select(Measure, C1_prop_Level, 
          Overall = mean_Overall,
          No      = mean_No,
@@ -1660,7 +1662,7 @@ summary_combined <- bind_rows(cesd_summary_long, prop_summary_long)
 
 ```{r}
 # 4. Optional: round values
-summary_combined <- summary_combined %>%
+summary_combined <- summary_combined |>
   mutate(across(c(Overall, No, Yes), ~ round(.x, 2)))
 gt_summary <- gt::gt(summary_combined) |>
   gt::tab_spanner("Depression", columns = c(No, Yes))|>
@@ -1689,9 +1691,9 @@ flextable::save_as_rtf(flextable_summary, path = file.path(results_path, "freq_t
 ```
 
 ```{r}
-esm_traits %>%
-  group_by(ID) %>%
-  summarise(age = first(AGE)) %>%
+esm_traits |>
+  group_by(ID) |>
+  summarise(age = first(AGE)) |>
   summarise(mean_age = mean(age, na.rm = TRUE),
             sd_age = sd(age, na.rm = TRUE))
 ```
