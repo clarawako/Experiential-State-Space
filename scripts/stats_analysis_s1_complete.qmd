@@ -1,0 +1,1694 @@
+---
+title: "Statistical analysis for the geometry of thought"
+author: "Clara Wakonigg"
+format:
+  html:
+    embed-resources: true
+    code-fold: false
+    number-sections: true
+toc: true
+toc-title: Table of contents
+toc-depth: 4
+toc-location: left
+execute: 
+  eval: false
+  echo: true
+output:
+  html_document:
+  output-file: stats_analysis_s1_complete.html
+---
+```{r}
+library(tidyverse)
+library(easystats)
+library(lme4)
+library(dplyr)
+library(glmmTMB) # for beta and binomial regressions
+library(ggeffects)
+library(psych)
+library(influence.ME)
+library(ggside)
+library(matrixStats)  # for rowMedians
+library(pdist)        # for distance matrices
+library(pracma) #for geometric median
+library(tidyr)
+library(depmixS4) # for HMMs
+library(broom)
+library(mutoss)
+library(clue)
+library(cluster) # for kmedoids
+library(concaveman)
+library(factoextra)
+```
+
+# Custom functions
+
+```{r}
+# FUNCTION TO FIT HMM MODEL FOR GIVEN K & SEED
+fit_hmm <- function(K, seed, data) {
+  set.seed(seed)
+  mod <- depmix(
+    response = list(
+      Component_1_z ~ 1,
+      Component_2_z ~ 1,
+      Component_3_z ~ 1,
+      Component_4_z ~ 1,
+      Component_5_z ~ 1
+    ),
+    data = data,
+    nstates = K,
+    family = rep(list(gaussian()), 5),
+    ntimes = as.numeric(table(data$ID))
+  )
+  fitted <- try(fit(mod, verbose = FALSE), silent = TRUE)
+  if (inherits(fitted, "try-error")) return(NA)
+  return(fitted)
+}
+```
+```{r}
+# FUNCTION TO EXTRACT STATE MEANS FROM OUTPUT
+extract_state_means <- function(model) {
+  # Each state has 5 response models (one per component)
+  sapply(model@response, function(state_list) {
+    sapply(state_list, function(r) r@parameters$coefficients)
+  })
+}
+```
+```{r}
+# FUNCTION TO COMPARE STATES
+state_similarity <- function(mat1, mat2) {
+  cor(mat1, mat2)  # returns K × K matrix
+}
+```
+```{r}
+# MATCH STATES
+match_states <- function(sim_mat) {
+  sim_mat[is.na(sim_mat)] <- 0             # replace NAs
+  # convert to non-negative cost matrix
+  cost_mat <- 1 - sim_mat                  # cost ∈ [0, 2]
+  solve_LSAP(cost_mat)                     # Hungarian algorithm
+}
+```
+```{r}
+# FUNCTION TO COMPUTE STABILITY OF STATES ACROSS K
+compute_stability_for_K <- function(dfK) {
+  mats <- dfK$state_means
+  n <- length(mats)
+  sims <- c()
+  for (i in 1:(n-1)) {
+    for (j in (i+1):n) {
+      if (is.matrix(mats[[i]]) && is.matrix(mats[[j]])) {
+        S <- cor(mats[[i]], mats[[j]])
+        S[is.na(S)] <- 0
+        assignment <- match_states(S)
+        matched <- S[cbind(1:ncol(S), assignment)]
+        sims <- c(sims, mean(matched))
+      }
+    }
+  }
+  mean(sims)
+}
+```
+
+```{r}
+# FUNCTION TO COMPUTE SWITCHING RATE IN A VECTOR OF STATES
+switching_rate <- function(states) {
+  if (length(states) < 2) return(NA_real_)
+  mean(diff(states) != 0)  # proportion of times state changes
+}
+```
+
+```{r}
+# FUNCTION TO COMPUTE TRANSITION PROBABILITIES WITH SELF TRANSITIONS
+compute_tpm <- function(states, n_states) {
+  # Create transition count matrix
+  tpm_counts <- matrix(0, nrow = n_states, ncol = n_states)
+  rownames(tpm_counts) <- paste0("S", 1:n_states)
+  colnames(tpm_counts) <- paste0("S", 1:n_states)
+  for (i in 1:(length(states) - 1)) {
+    from <- states[i]
+    to <- states[i + 1]
+    if (!is.na(from) && !is.na(to)) {
+      tpm_counts[from, to] <- tpm_counts[from, to] + 1
+    }
+  }
+  # Convert to probabilities (row-wise)
+  row_sums <- rowSums(tpm_counts)
+  tpm_probs <- sweep(tpm_counts, 1, row_sums, FUN = "/")
+  tpm_probs[is.na(tpm_probs)] <- 0
+  return(tpm_probs)
+}
+```
+```{r}
+## FUNCTION TO COMPUTE TRANISTION PROBABILITIES WITHOUT SELF TRANSITIONS
+compute_tpm_secondary <- function(states, n_states) {
+  # Transition count matrix
+  tpm_counts <- matrix(0, nrow = n_states, ncol = n_states)
+  rownames(tpm_counts) <- paste0("S", 1:n_states)
+  colnames(tpm_counts) <- paste0("S", 1:n_states)
+  for (i in 1:(length(states)-1)) {
+    from <- states[i]
+    to <- states[i + 1]
+    if (!is.na(from) && !is.na(to)) {
+      tpm_counts[from, to] <- tpm_counts[from, to] + 1
+    }
+  }
+  # Remove self-transitions (set diagonals to 0)
+  diag(tpm_counts) <- 0
+  # Convert to probabilities row-wise (renormalised on off-diagonal counts only)
+  row_sums <- rowSums(tpm_counts)
+  tpm_probs <- sweep(tpm_counts, 1, row_sums, FUN = "/")
+  tpm_probs[is.na(tpm_probs)] <- 0
+  return(tpm_probs)
+}
+```
+
+```{r}
+# Helper function to get pretty label
+get_label <- function(comp_name) {
+  component_labels$Label[component_labels$Component == comp_name]
+}
+```
+
+# Load the data
+
+```{r}
+data_path <- file.path(dirname(getwd()), "data", "master.csv")
+
+if (!file.exists(data_path)) {
+  stop("Dataset is currently not publicaly available.")
+}
+
+esm_traits <- read.csv(data_path) |>
+  dplyr::mutate(ID = forcats::as_factor(ID), 
+                Stimulus_Type = forcats::fct_relevel(Stimulus_Type, "Baseline", "pos", "neg"), 
+                GENDER = ifelse(GENDER == 1,"Female", "Male"))
+```
+
+```{r}
+# Count number of participants
+filtered_id <- esm_traits |> 
+  dplyr::group_by(ID) |>
+  dplyr::summarise(count = n())
+```
+
+```{r}
+# Count number of participants by Gender group
+esm_traits |> 
+  dplyr::distinct(ID, GENDER) |>  # Keep only one row per ID-GENDER pair
+  dplyr::count(GENDER) 
+```
+
+```{r}
+cesd_by_id <- esm_traits |>
+  dplyr::select(ID, CESD_stnd, CESD, AGE, GENDER) |>
+  distinct(ID, .keep_all = TRUE)
+```
+```{r}
+# create path string to save results to 
+results_path <- file.path(dirname(getwd()), "results")
+```
+
+## Standardise 
+
+```{r}
+component_cols <- c("Component_1", "Component_2", "Component_3", "Component_4", "Component_5")
+esm_traits_z <- esm_traits %>%
+  mutate(across(
+    all_of(component_cols),
+    ~ (.x - mean(.x, na.rm = TRUE)) / sd(.x, na.rm = TRUE),
+    .names = "{.col}_z"
+  )) 
+```
+
+```{r}
+# Filter Condition to only include everyday life (session 3) data
+esm_traits_base <- esm_traits_z |> 
+  dplyr::filter(Stimulus_Type == "Baseline") |>
+  dplyr::mutate(ID = droplevels(ID))
+```
+
+# Emotional Manipulation check
+
+```{r}
+affective_summary <- esm_traits_z |>
+group_by(Stimulus_Type) |>
+  datawizard::describe_distribution(Positive)
+affective_test <- lme4::lmer(Positive_stnd ~ Stimulus_Type + (1|ID), data = esm_traits_z)
+summary(affective_test)
+parameters::parameters(affective_test)
+```
+
+# Establish default thought patterns: calculate for each participant the geometric median of their observations
+
+```{r}
+centroid_summary <- esm_traits_z %>%
+  filter(Stimulus_Type == "Baseline") %>%
+  dplyr::select(ID, Component_1_z:Component_5_z) %>%
+  group_by(ID) %>%
+  group_split() %>%
+  map_dfr(function(df) {
+    comp_matrix <- df %>%
+      dplyr::select(Component_1_z:Component_5_z) %>%
+      drop_na() %>%
+      as.matrix()
+    geom_vec   <- geo_median(comp_matrix)$p  
+    tibble(
+      ID = unique(df$ID),
+      !!!set_names(as.list(geom_vec),   paste0("Geom_",   1:5))
+    )
+  })
+```
+
+```{r}
+# Join the geometric medians to the esm data
+esm_centroids <- esm_traits_z |>
+  left_join(centroid_summary, by = "ID")
+```
+
+```{r}
+# Calculate the distance for each observation to the geometric median
+esm_centroids <- esm_centroids %>%
+  rowwise() %>%
+  mutate(
+    Radius_geom = {
+      comps <- c_across(Component_1_z:Component_5_z)
+      geom_cent <- c_across(Geom_1:Geom_5)
+      sqrt(sum((comps - geom_cent)^2))
+    }
+  ) %>%
+  ungroup() |>
+  mutate(AGE_stnd = scale(AGE), 
+         GENDER = as_factor(GENDER))
+```
+
+# Similarity analysis
+
+```{r}
+participant_ids <- unique(esm_traits_base$ID)
+```
+
+```{r}
+# Create an empty data frame to store results
+within_similarity_df <- data.frame(ID = character(), within_similarity_z = numeric(), stringsAsFactors = FALSE)
+```
+
+```{r}
+# Loop over each participant ID
+for (id in participant_ids) {
+  # Subset data for the current participant
+  participant_data <- esm_traits_base %>%
+    dplyr::filter(ID == id) %>%
+    dplyr::select(c("Component_1_z":"Component_5_z"))
+  # Convert to matrix
+  participant_matrix <- as.matrix(participant_data)
+  # Only proceed if participant has more than 1 measurement
+  if (nrow(participant_matrix) > 1) {
+    # Compute trial × trial correlation
+    trial_cor <- cor(t(participant_matrix))
+    # Extract lower triangle
+    lower_vals <- trial_cor[lower.tri(trial_cor)]
+    #Fisher transform correlations before averaging
+    lower_vals_clipped <- pmin(pmax(lower_vals, -0.9999), 0.9999)
+    z_vals <- atanh(lower_vals_clipped)
+    # Compute mean z-value
+    mean_z <- mean(z_vals, na.rm = TRUE)
+    # Add result to the data frame
+    within_similarity_df <- rbind(within_similarity_df, data.frame(ID = id, within_similarity_z = mean_z))
+  }
+}
+mean_within_similarity <- mean(within_similarity_df$within_similarity_z)
+```
+
+```{r}
+# Between subject similarity
+mean_vectors <- esm_traits_base %>%
+  group_by(ID) %>%
+  summarise(across(c("Component_1_z":"Component_5_z"), \(x) mean(x, na.rm = TRUE))) %>%
+  ungroup()
+mean_matrix <- as.matrix(mean_vectors[, -1])
+```
+
+```{r}
+# Correlation matrix 
+between_cor <- cor(t(mean_matrix))
+```
+
+```{r}
+# extract lower triangle
+lower_between <- between_cor[lower.tri(between_cor)]
+```
+
+```{r}
+# Fisher z
+z_between <- atanh(lower_between)
+mean_between_similarity <- mean(z_between, na.rm = TRUE)
+within_z <- within_similarity_df$within_similarity_z
+between_z <- z_between  # the full lower triangle of between-subject correlations, Fisher-z transformed
+```
+
+```{r}
+# Compute the observed difference
+observed_diff <- mean(within_z) - mean(between_z)
+```
+
+```{r}
+# Combine all values into one vector
+all_z_values <- c(within_z, between_z)
+group_labels <- c(rep("within", length(within_z)), rep("between", length(between_z)))
+```
+
+```{r}
+# Set number of permutations
+n_perm <- 10000
+perm_diffs <- numeric(n_perm)
+set.seed(123)
+for (i in 1:n_perm) {
+  shuffled_labels <- sample(group_labels)
+  group1 <- all_z_values[shuffled_labels == "within"]
+  group2 <- all_z_values[shuffled_labels == "between"]
+  perm_diffs[i] <- mean(group1) - mean(group2)
+}
+```
+
+```{r}
+# p-value: how often is permuted diff ≥ observed diff?
+p_value <- mean(perm_diffs >= observed_diff)
+perm_df <- data.frame(perm_diff = perm_diffs)
+```
+
+```{r}
+# Make the plot
+permutation_plot <- ggplot(perm_df, aes(x = perm_diff)) +
+  geom_histogram(bins = 50, fill = "grey80", color = "black") +
+  geom_vline(xintercept = observed_diff, color = "#990000", size = 1.2) +
+  annotate("text",
+           x = Inf,
+           y = Inf,
+           label = "Observed\nDifference",
+           hjust = 0.99, vjust = 1, color = "#990000", size = 5) +
+  scale_x_continuous(limits = range(c(perm_diffs, observed_diff))) +
+  scale_y_continuous(limits = range(0,1000)) +
+  labs(
+    x = "Mean thought similarity difference (within - between)",
+    y = "Frequency"
+  ) +
+  theme_minimal(base_size = 20) +
+  theme(
+    plot.margin = unit(c(1, 2, 1, 2), "cm"),
+    panel.grid.major     = element_blank(),
+    panel.grid.minor     = element_blank(),
+    axis.line            = element_line(color = "black"),
+    axis.ticks           = element_line(color = "black"),
+    # inside top-right
+    legend.position      = c(0.997, 0.998),
+    legend.justification = c(1, 1),
+    legend.key.size      = unit(0.4, "cm"),
+    legend.text          = element_text(size = 18),
+    legend.spacing.y = unit(0,"cm"),
+  ) 
+ ggsave(
+   filename = file.path(results_path, "permutation_plot_new.svg"),
+   plot     = permutation_plot,
+   width    = 200,       # cm (1/3 of 84.1 cm)
+   height   = 150,     # cm (aspect ratio 10:6)
+   units    = "mm",
+   dpi      = 300
+ )
+```
+
+# Baseline models (101 participants)
+
+```{r}
+## Negative Intrusive thought modeled from depression levels
+dep_c1_lm <- lmerTest::lmer(Component_1_z ~ CESD_stnd + AGE + GENDER + (1|ID), data = esm_traits_base)
+anova_c1<- car::Anova(dep_c1_lm, type = 3, test.statistic = "F") |> 
+  as.data.frame()
+anova_tbl <- anova_c1 %>%
+  rownames_to_column(var = "term")
+anova_c1
+```
+
+```{r}
+# Plot the relationship
+depression_model_plot <- ggplot(
+  esm_traits_base,
+  aes(x = CESD_stnd, y = Component_1_z)
+) +
+  geom_point(
+    aes(color = "Data point"),
+    alpha = 0.15,
+    size = 1.5,
+    position = position_jitter(
+    width  = 0.05,   # small jitter on CESD axis
+    height = 0.00,   # small jitter on Component axis
+    seed = 123
+  )
+  ) +
+  geom_smooth(
+    aes(color = "Best fit", fill = "95% CI"),
+    method = "lm",
+    size = 1,
+    se = TRUE
+  ) +
+  # ---- SIDE DENSITIES (SAFE) ----
+  geom_xsidedensity(
+    aes(y = after_stat(density)),
+    fill = "grey70",
+    alpha = 0.4
+  ) +
+  geom_ysidedensity(
+    aes(x = after_stat(density)),
+    fill = "grey70",
+    alpha = 0.4
+  ) +
+  scale_color_manual(
+    name = NULL,
+    values = c(
+      "Data point" = "black",
+      "Best fit"   = "#990000"
+    )
+  ) +
+  scale_fill_manual(
+    name = NULL,
+    values = c("95% CI" = "#e06666"),
+    guide = guide_legend(override.aes = list(color = NA))
+  ) +
+  labs(
+    x = "Depression score (CESD)",
+    y = "Negative Intrusive Thought (Component 1)"
+  ) +
+  theme_minimal(base_size = 20) +
+  theme(
+    ggside.panel.scale = 0.25,
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.line = element_line(color = "black"),
+    axis.ticks = element_line(color = "black"),
+    legend.position = c(0.997, 0.998),
+    legend.justification = c(1, 1)
+  )
+depression_model_plot
+```
+
+```{r}
+ggsave(
+  filename = file.path(results_path, "depression_c1_scatter.svg"),
+  plot     = depression_model_plot,
+  width    = 280,       
+  height   = 150,     
+  units    = "mm",
+  dpi      = 300
+)
+```
+
+# Frequency Models
+
+```{r}
+# Calculate the median of Negative Intrusive thought
+median_c1 <- median(esm_traits_base$Component_1_z)
+```
+
+```{r}
+# Median split, to be able to count frequency of high and low negative intrusive thought experienced
+esm_traits_base <- esm_traits_base |>
+  mutate(C1_prop = case_when(
+    Component_1_z >= median_c1 ~ "High",
+    TRUE ~ "Low"
+  ))
+```
+
+```{r}
+# Categorise depression into Yes or No based on questionnaire threshold
+esm_traits_base <- esm_traits_base %>%
+  mutate(CESD_th = ifelse(CESD >= 16, "Yes", "No"))
+```
+
+```{r}
+# Calculate proportion of High and Low Negative Intrusive Thought
+participant_counts <- esm_traits_base %>%
+  group_by(ID, C1_prop, CESD_th) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  complete(ID, C1_prop, fill = list(n = 0)) |>
+  group_by(ID) |>
+  tidyr::fill(CESD_th, .direction = "downup") |>
+  mutate(prop = n / sum(n)) %>%
+  ungroup() 
+```
+
+### Model
+
+```{r}
+esm_binomial <- esm_traits_base %>%
+  group_by(ID) %>%
+  summarise(
+    high = sum(C1_prop == "High", na.rm = TRUE),
+    total = n(),
+    CESD_stnd = first(CESD_stnd),
+    AGE = first(AGE),
+    GENDER = first(GENDER)
+  ) %>%
+  mutate(low = total - high)
+```
+
+```{r}
+model_binom <- glm(cbind(high, total - high) ~ CESD_stnd + AGE + GENDER,
+                   family = binomial(link = "logit"),
+                   data = esm_binomial)
+summary(model_binom)
+or_bi <- parameters::parameters(model_binom, exponentiate = TRUE, p_adjust = "fdr") 
+or_bi |> knitr::kable(digits = 3)
+```
+
+```{r}
+binomial_plot <-ggplot(esm_binomial, aes(x = CESD_stnd, y = high / total)) +
+  geom_point(color = "black", alpha = 0.6, size = 1.5) +
+  stat_smooth(method = "glm", 
+              method.args = list(family = "binomial"), 
+              se = TRUE, 
+              color = "#990000") +
+  labs(
+    y = "Proportion of High Negative Intrusive Thoughts", 
+    x = "Depression Score (CESD)"
+  ) +
+  theme_minimal(base_size = 18) 
+binomial_plot
+```
+
+```{r}
+ggsave(
+  filename = file.path(results_path, "binomial_plot_c1.jpg"),
+  plot     = binomial_plot,
+  width    = 240,       # cm (1/3 of 84.1 cm)
+  height   = 150,     # cm (aspect ratio 10:6)
+  units    = "mm",
+  dpi      = 300
+)
+```
+
+# HMMs
+
+```{r}
+esm_hmm <- esm_centroids |>
+  filter(Stimulus_Type == "Baseline") |>
+  arrange(ID, Date) %>%
+  dplyr::select(ID, Date, Component_1_z:Component_5_z) 
+```
+
+```{r}
+# SETTINGS
+K_values <- 2:5
+seeds    <- 1:20
+```
+
+```{r}
+# RUN ALL MODELS
+results <- expand.grid(K = K_values, seed = seeds) %>%
+  mutate(
+    model = map2(K, seed, ~ fit_hmm(.x, .y, esm_hmm)),
+    logLik = map_dbl(model, function(m) {
+      if (inherits(m, "try-error") || is.null(m)) return(NA_real_)
+      as.numeric(logLik(m))
+    })
+  )
+
+```
+
+```{r}
+# Plot log-lik for each K
+k_log_plot <- ggplot(results, aes(x = K, y = logLik)) +
+  stat_summary(fun = mean, geom = "line", linewidth = 1) +
+  stat_summary(fun.data = mean_cl_normal, geom = "errorbar", width = 0.1) +
+  geom_point(alpha = 0.6) +
+  theme_minimal(base_size = 40) +
+  labs(
+    x = "Number of states",
+    y = "Log-likelihood"
+  )
+ggsave(
+  filename = file.path(results_path, "k_log_plot.png"),
+  plot     = k_log_plot,
+  units    = "mm",
+  width = 700,
+  height = 320,
+  dpi   = 300
+)
+```
+
+
+```{r}
+# Extract state maps
+results <- results |>
+  mutate(
+    state_means = map(model, ~ {
+      if (!inherits(.x, "try-error")) {
+        extract_state_means(.x)
+      } else {
+        NA
+      }
+    })
+  )
+```
+```{r}
+# Compute and plot stability of states as the average similarity between state maps obtained from models trained with different random initialisations.
+stability_scores <- results %>%
+  group_by(K) %>%
+  dplyr::summarise(stability = compute_stability_for_K(cur_data()))
+
+state_stability_plot <- ggplot(stability_scores, aes(K, stability)) +
+  geom_point(size = 4) +
+  geom_line() +
+  theme_minimal(base_size = 40) +
+  labs(
+    x = "Number of HMM states (K)",
+    y = "Cross-seed state map stability"
+  )
+ggsave(
+  filename = file.path(results_path, "state_stability.png"),
+  plot     = state_stability_plot,
+  units    = "mm",
+  width = 700,
+  height = 320,
+  dpi   = 300
+)
+```
+
+
+```{r}
+# Now we keep only one model K =3
+nstates = 3
+
+build_model <- function(startseed) {
+  set.seed(startseed)
+  mod <- depmix(response = list(
+    Component_1_z ~ 1,
+    Component_2_z ~ 1,
+    Component_3_z ~ 1,
+    Component_4_z ~ 1,
+    Component_5_z ~ 1),
+    data = esm_hmm,
+    nstates = nstates,
+    family = rep(list(gaussian()), 5),
+    ntimes = as.numeric(table(esm_hmm$ID)))
+  fit(mod, verbose = FALSE)
+}
+```
+
+```{r}
+# Try multiple seeds to see consistency across initiations
+seeds <- 1:20 # K=2: 12, K=3: 19, K= 4: 11,  K=5: 16
+models <- lapply(seeds, build_model)
+```
+
+```{r}
+# Compare log-likelihoods
+log_liks <- sapply(models, logLik)
+```
+```{r}
+# Pick the best model
+best_index <- which.max(log_liks)
+```
+
+```{r}
+# Extract the best model and its seed
+best_model <- models[[best_index]]
+best_model_seed <- seeds[best_index]
+AIC(best_model)
+BIC(best_model)
+logLik(best_model)
+fitted_mod <- best_model
+```
+
+```{r}
+# Decode the viterbi path from the state probabilities
+esm_hmm$State <- posterior(fitted_mod, type = 'viterbi')$state
+model_summary <- suppressMessages(capture.output(summary_obj <- summary(fitted_mod)))
+state_table <- as.data.frame(summary_obj)
+```
+```{r}
+# Keep only columns with intercepts (means), e.g., "Re1.(Intercept)", "Re2.(Intercept)", etc.
+mean_cols <- grep("\\.\\(Intercept\\)", names(state_table), value = TRUE)
+```
+
+```{r}
+# Subset just the mean columns
+state_means <- state_table[, mean_cols]
+```
+
+```{r}
+# Rename columns to Component_1, Component_2, etc.
+colnames(state_means) <- paste0("Component_", seq_along(mean_cols))
+```
+
+```{r}
+# Add State identifier
+state_means <- state_means |>
+  mutate(State = paste0("State_", row_number())) |>
+  relocate(State)
+```
+
+```{r}
+# Demean weights within each state (row-wise centering)
+state_means_demeaned <- state_means %>%
+  rowwise() %>%
+  mutate(across(starts_with("Component"),
+                ~ .x - mean(c_across(starts_with("Component"))))) %>%
+  ungroup()
+# Raw state weights
+state_means_raw <- state_means %>%
+  pivot_longer(cols = starts_with("Component"),
+               names_to = "Component",
+               values_to = "Weight") |>
+  mutate(State = fct_relevel(State, "State_3", "State_2", "State_1"))
+```
+
+```{r}
+# Plot of state means without demeaning
+state_composition <- ggplot(state_means_raw, aes(x = Component, y = State, fill = Weight)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = round(Weight, 2)), size = 20) +
+  scale_fill_gradient2(low = "#0c60ac", mid = "white", high = "#cc0000",
+                       midpoint = 0, name = "") +
+  scale_x_discrete(labels = labels) +
+  scale_y_discrete(
+    labels = c(
+      "State_1" = "S1: On-Task - Intrusive, Distraction",
+      "State_2" = "S2: Off task - Rumination",
+      "State_3" = "S3: Pleasure state"
+    )
+  ) +
+  labs(x = "", y = "") +
+  theme(
+    panel.background = element_blank(),
+    legend.title = element_text(size = 20),
+    legend.text = element_text(size = 20),
+    axis.text = element_text(size = 20)
+  )
+ggsave(
+  filename = file.path(results_path, "state_composition.svg"),
+  plot     = state_composition,   
+  units    = "mm",
+  width = 700,
+  height = 320,
+  dpi   = 300
+)
+```
+
+## HMM dynamics
+
+```{r}
+# Compute switching rate for each state per participant
+switching_df <- esm_hmm %>%
+  group_by(ID) %>%
+  summarise(switch_rate = switching_rate(State), .groups = "drop") |>
+  left_join(cesd_by_id, by = "ID") |>
+  mutate(
+    AGE_stnd = scale(AGE),            
+    GENDER = forcats::as_factor(GENDER),
+  )
+
+switching_counts <- esm_hmm %>%        
+  group_by(ID) %>%
+  dplyr::summarise(
+    total_transitions = n() - 1,    # number of transitions = observations − 1
+    n_switches = sum(diff(State) != 0),  # number of times state changes
+    switch_rate = n_switches / total_transitions,  # optional check
+  ) %>%
+  ungroup() |> 
+  left_join(cesd_by_id, by = "ID") |>
+  mutate(
+    AGE_stnd = scale(AGE),             
+    GENDER = forcats::as_factor(GENDER),
+  )
+```
+
+```{r}
+# Fit model of switching rates from depression age and gender
+switch_binomial <- glm(
+  cbind(n_switches, total_transitions - n_switches) ~ CESD_stnd + AGE_stnd + GENDER,
+  data = switching_counts,
+  family = binomial
+)
+
+summary(switch_binomial)
+sw_bi <- parameters::parameters(switch_binomial, exponentiate = TRUE, p_adjust = "fdr") 
+sw_bi |> knitr::kable(digits = 3)
+```
+
+### Transition probabilities
+
+```{r}
+n_states <- length(unique(esm_hmm$State))
+```
+
+```{r}
+# Compute TPMs per participant (with self transitions)
+participant_tpms <- esm_hmm %>%
+  group_by(ID) %>%
+  group_split() %>%
+  map(~ compute_tpm(.x$State, n_states))
+```
+```{r}
+# Name each matrix by participant ID
+names(participant_tpms) <- unique(esm_hmm$ID)
+
+tpm_long_df <- map2_dfr(participant_tpms, names(participant_tpms), function(mat, id) {
+  as_tibble(mat, .name_repair = "minimal") %>%
+    mutate(from = rownames(mat), ID = id) %>%
+    pivot_longer(cols = starts_with("S"), names_to = "to", values_to = "prob")
+})
+
+# Join TMP to depression and demographic data
+tpm_with_cesd <- tpm_long_df %>%
+  left_join(cesd_by_id, by = "ID") |>
+  mutate(
+    AGE_stnd = scale(AGE),        
+    GENDER = forcats::as_factor(GENDER),
+  )
+
+# Create symmetrical matrix 
+tpm_sym <- tpm_with_cesd %>%  
+  mutate(
+    pair = ifelse(from < to,
+                  paste0(from, "_", to),
+                  paste0(to, "_", from))
+  )
+
+tpm_pair_avg <- tpm_sym %>%
+  group_by(ID, pair) %>%
+  summarise(
+    prob_avg = mean(prob, na.rm = TRUE),
+    CESD_stnd = first(CESD_stnd),
+    AGE_stnd  = first(AGE_stnd),
+    GENDER    = first(GENDER),
+    .groups = "drop"
+  )
+```
+
+```{r}
+# Fit a model for each from to transition pair, correct for multiple comparisons
+transition_sym_stats <- tpm_pair_avg %>%
+  group_by(pair) %>%
+  nest() %>%
+  mutate(
+    model = map(data, ~ lm(prob_avg ~ CESD_stnd + AGE_stnd + GENDER, data = .x)),
+    tidy  = map(model, ~ broom::tidy(.x, conf.int = TRUE))
+  ) %>%
+  unnest(tidy) %>%
+  group_by(term) |>
+  mutate(p_fdr = p.adjust(p.value, method = "fdr")) |>
+  ungroup() %>%
+  mutate(across(where(is.numeric), ~ round(.x, 3)))
+```
+
+```{r}
+# Compute secondary TPM per participant (without self-transitions)
+participant_tpms_secondary <- esm_hmm %>%
+  group_by(ID) %>%
+  group_split() %>%
+  map(~ compute_tpm_secondary(.x$State, n_states))
+```
+
+```{r}
+# Name each matrix by participant ID
+names(participant_tpms_secondary) <- unique(esm_hmm$ID)
+```
+
+```{r}
+# Convert to long df for analysis
+tpm_secondary_long <- map2_dfr(participant_tpms_secondary,
+                               names(participant_tpms_secondary),
+                               function(mat, id) {
+                                 as_tibble(mat, .name_repair = "minimal") %>%
+                                   mutate(from = rownames(mat), ID = id) %>%
+                                   pivot_longer(cols = starts_with("S"),
+                                                names_to = "to",
+                                                values_to = "prob")
+                               })
+```
+
+```{r}
+# Add CESD scores
+tpm_secondary_long <- tpm_secondary_long %>%
+  left_join(cesd_by_id, by = "ID") |>
+  mutate(
+    AGE_stnd = scale(AGE),             
+    GENDER = forcats::as_factor(GENDER),
+  )
+
+# Compute symmetrical matrix of transitions
+tpm_sym_sec <- tpm_secondary_long %>%
+  filter(from != to) %>%    
+  mutate(
+    pair = ifelse(from < to,
+                  paste0(from, "_", to),
+                  paste0(to, "_", from))
+  )
+
+tpm_pair_sec <- tpm_sym_sec %>%
+  group_by(ID, pair) %>%
+  summarise(
+    prob_avg = mean(prob, na.rm = TRUE),
+    CESD_stnd = first(CESD_stnd),
+    AGE_stnd  = first(AGE_stnd),
+    GENDER    = first(GENDER),
+    .groups = "drop"
+  )
+```
+
+```{r}
+# Fit a model for each transition pair, correct for multiple comparisons
+transition_sym_stats_sec <- tpm_pair_sec %>%
+  group_by(pair) %>%
+  nest() %>%
+  mutate(
+    model = map(data, ~ lm(prob_avg ~ CESD_stnd + AGE_stnd + GENDER, data = .x)),
+    tidy  = map(model, ~ broom::tidy(.x, conf.int = TRUE))
+  ) %>%
+  unnest(tidy) %>%
+  group_by(term) |>
+  mutate(p_fdr = p.adjust(p.value, method = "fdr")) |>
+  ungroup() %>%
+  mutate(across(where(is.numeric), ~ round(.x, 3)))
+```
+
+```{r}
+# Compute fractional occupancy per participant × state
+fractional_occupancy <- esm_hmm %>%
+  group_by(ID, State) %>%
+  summarise(n_timepoints = n(), .groups = "drop") %>%
+  group_by(ID) %>%
+  mutate(FO = n_timepoints / sum(n_timepoints)) %>%
+  ungroup() %>%
+  complete(ID, State, fill = list(FO = 0, n_timepoints = 0)) %>%
+  left_join(cesd_by_id, by = "ID") |>
+  mutate(
+    AGE_stnd = scale(AGE),            
+    GENDER = forcats::as_factor(GENDER),
+  )
+```
+
+```{r}
+# Fit a model for each state, correct for multiple comparisons
+fo_beta_results <- fractional_occupancy %>%
+  group_by(State) %>%
+  nest() %>%
+  mutate(
+    model = map(data, ~ glmmTMB(FO ~ CESD_stnd ,
+                                data = .x,
+                                family = ordbeta(link = "logit"))),
+    tidy = map(model, ~ broom.mixed::tidy(.x, conf.int = TRUE))
+  ) %>%
+  unnest(tidy) %>%
+  mutate(term = as.character(term)) %>%
+  # --- NEW: apply FDR correction ---
+  group_by(term) %>%
+  mutate(p_adj_fdr = p.adjust(p.value, method = "fdr")) %>%
+  mutate(across(where(is.numeric), ~ round(.x, 4)))
+```
+
+# Cluster analysis
+```{r}
+## Cluster analysis of the centroid coordinates of participants
+centroid_dep <- centroid_summary |>
+  left_join(esm_traits_z |> dplyr::select(ID, AGE, GENDER, CESD, CESD_stnd) |> distinct(), by = "ID")
+
+sil_results <- data.frame(k = 2:8, avg_sil = NA)
+for (k in 2:8) {
+  pam_fit <- pam(centroid_dep[, c("Geom_1","Geom_2","Geom_3","Geom_4","Geom_5")],
+                 k = k, metric = "euclidean")
+  sil_obj <- silhouette(pam_fit)
+  sil_results$avg_sil[sil_results$k == k] <- mean(sil_obj[, "sil_width"])
+}
+
+sil_results
+
+plot(sil_results$k, sil_results$avg_sil, type = "b",
+     xlab = "k", ylab = "Average silhouette width")
+```
+
+```{r}
+# Plot the silhouette width to identify best K cluster
+sil_plot <- ggplot(sil_results, aes(x = k, y = avg_sil)) +
+  geom_line(linewidth = 0.6, linetype = 1) +   # line first, underneath
+  geom_point(shape = 21, size = 3, fill = "white", stroke = 1) +  # dots above
+  labs(x = "k", y = "Average silhouette width") +
+  theme_minimal(base_size = 18)
+
+ggsave(filename = file.path(results_path, "silhouette_plot.png"),
+  plot     = sil_plot,
+  width    = 200,       # cm (1/3 of 84.1 cm)
+  height   = 150,     # cm (aspect ratio 10:6)
+  units    = "mm",
+  dpi      = 300)
+```
+
+```{r}
+# Fit the clustering on selected K
+set.seed(123)
+
+esm_kmed_cent <- pam(centroid_dep[, c("Geom_1", "Geom_2", "Geom_3", "Geom_4", "Geom_5")], k = 4, metric = "euclidean", stand = FALSE)
+centroid_dep$cluster_med <- esm_kmed_cent$cluster
+centroid_dep <- centroid_dep |>
+  ungroup() |>
+  dplyr::mutate(cluster_med = forcats::as_factor(cluster_med),
+                cluster_med = forcats::fct_relevel(cluster_med, "1"),
+                AGE_stnd = as.numeric(scale(AGE)),             # Standardised (z-scored)
+                GENDER = forcats::as_factor(GENDER)
+  ) 
+```
+
+```{r}
+# Fit a model to test if the cluster membership based on the centroid coordinates predicts levels of depression
+cluster_centroid <- lm(CESD_stnd ~ cluster_med + AGE_stnd + GENDER, data = centroid_dep)
+summary(cluster_centroid)
+
+modelbased::estimate_contrasts(cluster_centroid, contrast = "cluster_med",adjust = "fdr",fixed = c("AGE_stnd", "GENDER")) |> knitr::kable(digits = 3)
+```
+
+```{r}
+# Cluster plot 
+# ---- Component label lookup ----
+component_labels <- tibble(
+  Component = c("Geom_1", "Geom_2", "Geom_3", "Geom_4", "Geom_5"),
+  Label     = c(
+    "Negative Intrusive Thought",
+    "Goal Directed Thinking",
+    "Mental Time Travel",
+    "Positive Focus",
+    "Modality"
+  )
+)
+```
+
+```{r}
+# --- All Geom columns ---
+geom_vars <- component_labels$Component
+```
+
+```{r}
+# --- All unique pairs (Geom_i, Geom_j) where i < j ---
+pairs <- combn(geom_vars, 2, simplify = FALSE)
+```
+
+```{r}
+# Compute convex hull per cluster (the outline of the cloud)
+# convex hull algorithm
+
+# ---- Loop over each pair ----
+for (pair in pairs) {
+  x_var <- pair[1]
+  y_var <- pair[2]
+  x_lab <- get_label(x_var)
+  y_lab <- get_label(y_var)
+  cluster_hulls <- centroid_dep %>%
+    filter(cluster_med %in% c(1,2)) %>%
+    group_by(cluster_med) %>%
+    do({
+      # extract numeric matrix (NO tibble!)
+      pts <- as.matrix(select(., Geom_1, Geom_2, Geom_3, Geom_4, Geom_5))
+      # concaveman requires a matrix of xy coordinates
+      hull <- concaveman(pts)
+      # concaveman returns a matrix → convert to df & add cluster label
+      hull_df <- as.data.frame(hull)
+      names(hull_df) <- c("Geom_1", "Geom_2", "Geom_3", "Geom_4", "Geom_5")
+      hull_df$cluster_med <- unique(.$cluster_med)
+      hull_df
+    }) %>%
+    ungroup()
+  # Build plot
+  p <- ggplot() +
+    geom_polygon(
+      data = cluster_hulls,
+      aes(x = .data[[x_var]], y = .data[[y_var]], fill = cluster_med, group = cluster_med),
+      alpha = 0.08, colour = NA
+    ) +
+    geom_path(
+      data = cluster_hulls,
+      aes(x = .data[[x_var]], y = .data[[y_var]], colour = cluster_med, group = cluster_med),
+      linewidth = 1.1
+    ) +
+    scale_fill_brewer(palette = "Dark2", name = "Cluster", labels = c("Reference", "Cluster of interest")) +
+    scale_color_brewer(palette = "Dark2", guide = "none") +
+    ggnewscale::new_scale_color() +
+    geom_point(
+      data = centroid_dep %>% filter(cluster_med %in% c(1,2)),
+      aes(x = .data[[x_var]], y = .data[[y_var]], color = CESD_stnd),
+      size = 2, alpha = 0.8
+    ) +
+    scale_color_gradient(
+      low = "#0b6ac8", high = "#cc0000",
+      limits = c(-0.77872644, 0.4712813),
+      oob = scales::squish,
+      name = "Depression"
+    ) +
+    labs(x = x_lab, y = y_lab) +
+    theme_minimal(base_size = 16)
+  # #Save file
+  # filename <- paste0(/results/cluster_new", x_var, "_", y_var, ".svg")
+  # ggsave(filename, p, width = 7, height = 6, dpi = 300)
+  # 
+  # message("Saved: ", filename)
+}
+```
+
+# Distance analysis
+
+```{r}
+esm_radius <- esm_centroids |>
+  filter(Stimulus_Type != "Baseline") |>
+  mutate(droplevels(Stimulus_Type))
+
+radius_mixed <- lmer(Radius_geom ~ Stimulus_Type + AGE_stnd + GENDER + (Stimulus_Type| ID), data = esm_centroids)
+
+summary(radius_mixed)
+
+parameters::parameters(radius_mixed, p_adjust = "fdr")
+
+esm_stim_cent <- esm_centroids |>
+  mutate(Condition = recode(Stimulus_Type,
+                            "Baseline" = "Baseline",
+                            "pos" = "Positive",
+                            "neg" = "Negative")
+  )
+```
+
+```{r}
+cols <- c("Positive" = "#cc0000", "Negative" = "#0c60ac", "Baseline" = "#444444")
+violin_distance <- ggplot(esm_stim_cent, aes(x = Condition, y = Radius_geom, fill = Condition)) +
+  geom_violin(position = position_dodge(width = 0.9), width = 0.8, alpha = 0.6, show.legend = FALSE) +
+  geom_boxplot(position = position_dodge(width = 0.9), width = 0.1, color = "#444444", alpha = 0.2, show.legend = FALSE) +
+  scale_fill_manual(values = cols) +
+  ylim(0, 5) +
+  labs(x = "Condition", y = "Distance from centroid") +
+  theme_minimal(base_size = 13) +
+  theme(
+    axis.line = element_line(linewidth = 0.8, colour = "black", linetype = 1),
+    panel.grid.minor = element_blank(),
+    axis.title.x = element_text(margin = margin(t = 10)),
+    axis.title.y = element_text(margin = margin(r = 10))
+  )
+
+ggsave(
+  filename = file.path(results_path, "violin_distance.svg"),
+  plot     = violin_distance,   
+  units    = "mm",
+  dpi      = 300
+)
+```
+
+```{r}
+# Directional displacement analysis
+centroid_neg <- esm_centroids |>
+  filter(Stimulus_Type == "neg") 
+
+centroid_pos <- esm_centroids |>
+  filter(Stimulus_Type == "pos")
+
+centroid_pos <- centroid_pos |>
+  group_by(ID) |>
+  summarise(across(Component_1_z:Component_5_z, \(x) mean(x, na.rm = TRUE)), .groups = "drop")
+
+centroid_neg <- centroid_neg |>
+  group_by(ID) |>
+  summarise(across(Component_1_z:Component_5_z, \(x) mean(x, na.rm = TRUE)), .groups = "drop")
+
+component_names <- paste0("Component_", 1:5, "_z")
+cent_names <- paste0("Geom_", 1:5)
+```
+
+```{r}
+# Dot product of vectors a * b = ||a||*||b||cos0
+delta_neg <- centroid_neg[, component_names] - centroid_summary[, paste0(cent_names)]
+delta_pos <- centroid_pos[, component_names] - centroid_summary[, paste0(cent_names)]
+dot <- rowSums(delta_pos*delta_neg)
+```
+
+```{r}
+# Vector norms
+norm_neg <- sqrt(rowSums(delta_neg^2))
+norm_pos <- sqrt(rowSums(delta_pos^2))
+```
+
+```{r}
+# Cosine of angle (clip to avoid invalid arccos)
+cos_theta <- dot / (norm_neg * norm_pos)
+cos_theta <- pmin(pmax(cos_theta, -1), 1)  # Clamp to [-1, 1]
+```
+```{r}
+# Angle in degrees
+angles_deg <- acos(cos_theta) * (180 / pi)
+```
+
+```{r}
+# Combine into a data frame
+angle_df <- data.frame(
+  ID = centroid_neg$ID,
+  Angle_Pos_Neg = angles_deg
+)
+
+mean_delta_neg <- colMeans(delta_neg)
+mean_delta_pos <- colMeans(delta_pos)
+
+group_dot  <- sum(mean_delta_neg * mean_delta_pos)
+group_norm <- sqrt(sum(mean_delta_neg^2)) * sqrt(sum(mean_delta_pos^2))
+group_angle <- acos(group_dot / group_norm) * (180 / pi)
+
+t_test <- t.test(angle_df$Angle_Pos_Neg, mu = 0)
+cat("Group-level angle (Pos vs. Neg):", round(group_angle, 2), "degrees\n")
+cat("Mean individual angle:", round(mean(angle_df$Angle_Pos_Neg), 2), "degrees\n")
+cat("t =", round(t_test$statistic, 3), 
+    ", p =", format.pval(t_test$p.value, digits = 3), 
+    ", N =", nrow(angle_df), "\n")
+```
+```{r}
+angle_graph <- ggplot(angle_df, aes(x = Angle_Pos_Neg)) +
+  geom_density(fill = "#0c60ac", alpha = 0.4) +
+  geom_vline(xintercept = mean(angle_df$Angle_Pos_Neg), linetype = "dashed", color = "black") +
+  annotate("text", x = mean(angle_df$Angle_Pos_Neg) + 5, y = 0.015, label = "Mean angle", hjust = 0) +
+  labs(title = "Distribution of Angles Between Positive and Negative Displacements",
+       x = "Angle (degrees)", y = "Density") +
+  theme_minimal()
+ggsave(
+  filename = file.path(results_path,"angle_graph.svg"),
+  plot     = angle_graph,   
+  units    = "mm",
+  dpi      = 300
+)
+```
+
+### Components driving the divergence
+```{r}
+# Step 1: Difference between pos and neg deltas
+delta_diff <- delta_pos[, 1:5] - delta_neg[, 1:5]
+delta_diff <- delta_diff[complete.cases(delta_diff), ]  # remove any NAs
+```
+```{r}
+# Step 2: Compute mean, SD, and t-tests for each component
+means <- colMeans(delta_diff)
+sds   <- apply(delta_diff, 2, sd)
+t_res <- map_dfr(delta_diff, ~ broom::tidy(t.test(.x, mu = 0)), .id = "Component")
+```
+```{r}
+# Step 3: Assemble into summary table
+divergence_by_component <- tibble(
+  Component  = names(means),
+  Mean_Diff  = means,
+  Std_Diff   = sds
+) %>%
+  left_join(t_res %>% dplyr::select(Component, statistic, p.value), by = "Component") %>%
+  rename(t_value = statistic, p_value = p.value) %>%
+  arrange(p_value) 
+```
+
+```{r}
+# View table
+divergence_by_component |> mutate(across(where(is.numeric), ~round(., 3)),
+                                  p_fdr = p.adjust(p_value, method = "fdr")) 
+```
+
+```{r}
+#Step 1: Compute means of displacement vectors
+mean_delta_pos <- colMeans(delta_pos[, 1:5])
+mean_delta_neg <- colMeans(delta_neg[, 1:5])
+```
+
+```{r}
+# Step 2: Create human-readable labels
+labels <- c(
+  "Component_1_z" = "Negative Intrusive Thought",
+  "Component_2_z" = "Goal Directed Thinking",
+  "Component_3_z" = "Mental Time Travel",
+  "Component_4_z" = "Positive Engagement",
+  "Component_5_z" = "Modality"
+)
+```
+
+```{r}
+# Step 3: Assemble into summary table
+direction_summary <- tibble(
+  Component = names(mean_delta_pos),
+  Label     = labels[names(mean_delta_pos)],
+  Mean_Pos_Displacement = mean_delta_pos,
+  Mean_Neg_Displacement = mean_delta_neg
+)
+```
+
+```{r}
+# View table
+print(direction_summary)
+
+direction_radar <- direction_summary |>
+  dplyr::select(Label, Mean_Pos_Displacement, Mean_Neg_Displacement) |>
+  pivot_longer(cols = starts_with("Mean_"), names_to = "Condition", values_to = "Value") |>
+  pivot_wider(names_from = Label, values_from = Value)
+```
+
+```{r}
+# Create the max and min rows as one-row data frames
+max_row <- as.data.frame(matrix(1, nrow = 1, ncol = ncol(direction_radar)))
+min_row <- as.data.frame(matrix(-1, nrow = 1, ncol = ncol(direction_radar)))
+```
+
+```{r}
+#Copy column names from your main data
+colnames(max_row) <- colnames(direction_radar)
+max_row$Condition <- "Max"
+colnames(min_row) <- colnames(direction_radar)
+min_row$Condition <- "Min"
+```
+
+```{r}
+# Bind all together
+radar_dir <- bind_rows(max_row, min_row, direction_radar)
+png(file.path("results","radar_plot_displacement.png"), width = 1200, height = 1000, res = 300)
+```
+
+```{r}
+# Expand plotting area: reduce margins
+op <- par(mar = c(1, 1, 1, 1))  # bottom, left, top, right
+```
+
+```{r}
+# Set colors and labels
+colors_border <- c("#cc0000", "#0c60ac")  # Positive, Negative
+labels_order <- radar_dir$Condition
+```
+
+```{r}
+# Plot
+radarchart(radar_dir|> dplyr::select(-Condition),
+           axistype = 1,
+           seg = 4,
+           pcol = colors_border,
+           plwd = 2,
+           plty = 1,
+           cglcol = "grey", cglty = 1,
+           axislabcol = "grey", caxislabels = c(-1, -0.5, 0, 0.5, 1), cglwd = 1,
+           vlcex = 0.8)
+legend(x = "bottomright", title = "Condition", legend = c("Positive", "Negative"),
+       bty = "n", pch = 20, col = colors_border, text.col = "black", cex = 1, pt.cex = 2)
+```
+```{r}
+# Reset plotting parameters
+par(op)
+```
+
+
+# Mood Model
+
+
+```{r}
+esm_traits_z <- esm_traits_z |>
+  mutate(
+    AGE_stnd = scale(AGE),
+    GENDER = as_factor(GENDER)
+  )
+```
+
+## Component 1
+
+```{r}
+mood_depression_mdl <- lme4::lmer(Component_1_z ~ Stimulus_Type * CESD_stnd  + AGE_stnd + GENDER + (Stimulus_Type|ID), data = esm_traits_z)
+
+summary(mood_depression_mdl)
+
+ci_dep_int_param <- parameters::parameters(mood_depression_mdl)
+ci_dep_int_param |> knitr::kable(digits = 3)
+```
+
+```{r}
+cols <- c("Baseline" = "#595959", "pos" = "#cc0000", "neg" = "#0c60ac" )
+
+pred <- estimate_relation(mood_depression_mdl)
+
+depression_model_plot <- pred |> 
+  ggplot(aes(x=CESD_stnd, y=Predicted)) +
+  geom_point(data = esm_traits,
+             aes(x = CESD_stnd, y = Component_1, color = Stimulus_Type),
+             alpha = 0.25, size = 1.2, inherit.aes = FALSE, position = "jitter") +
+  geom_ribbon(aes(fill=Stimulus_Type, ymin=CI_low, ymax=CI_high), alpha=0.1) +
+  geom_line(aes(color=Stimulus_Type), size =0.8, position = "dodge") + 
+  labs( y="Negative Intrusive Thought scores", x="Depression scores (CESD)", fill="Condition") +
+  scale_color_manual(aesthetics = c("colour", "fill"), labels = c("Default", "Positive", "Negative"), values = cols) +
+  guides(color=guide_legend("Condition")) +
+  theme_minimal(base_size = 20) +
+    theme(
+      panel.grid.major     = element_blank(),
+      panel.grid.minor     = element_blank(),
+      axis.line            = element_line(color = "black", linewidth = 0.7),
+      axis.ticks           = element_line(color = "black"),
+      # inside top-right   
+      legend.position      = "top",
+      legend.location = "panel",
+      legend.key.size      = unit(0.7, "cm"),
+      legend.text          = element_text(size = 18),
+      legend.title = element_text(face = "bold"),
+    )
+
+depression_model_plot
+```
+
+```{r}
+ggsave(file.path(results_path, "depression_int_c1.svg"),
+  plot     = depression_model_plot,
+  width    = 200,       # cm (1/3 of 84.1 cm)
+  height   = 155,     # cm (aspect ratio 10:6)
+  units    = "mm",
+  dpi      = 300
+)
+```
+
+```{r}
+estimate_slopes(mood_depression_mdl, trend="CESD_stnd", by="Stimulus_Type")
+estimate_contrasts(mood_depression_mdl, contrast = "Stimulus_Type", by="CESD_stnd", length=3, p_adjust = "fdr") |> knitr::kable(digits = 3)
+```
+
+# Cronback's alpha
+
+```{r}
+traits <- read.csv(file.path("results", "Combined_traits.csv"))|> 
+  dplyr::mutate(ID = forcats::as_factor(ID))
+```
+
+```{r}
+traits <- traits |>
+  drop_na(c(24:63))
+a_CESD<- ltm::cronbach.alpha(traits[,24:43],standardized = TRUE, CI=T)
+CI_CESD <- a_CESD$ci
+```
+
+```{r}
+# Create the table
+alpha_tbl <- data.frame(
+  Questionnaire = c("CESD"),
+  'Number of Items' = c(a_CESD$p),
+  Alpha = c(a_CESD$alpha),
+  'Lower CI' = c(CI_CESD[1]), 
+  'Upper CI'=c(CI_CESD[2])) |> rempsyc::nice_table()
+```
+
+# Descriptive stats
+
+```{r}
+response_rate <- esm_traits_base |>
+  mutate(
+    Date = ymd_hms(Date),  
+    Day      = as.Date(Date),          
+    Time     = format(Date, "%H:%M:%S")) |>
+  group_by(ID, Day) |>
+  summarise(n_entries = n(), .groups = "drop")
+```
+
+```{r}
+rr_stats <- response_rate |>
+  group_by(ID) |>
+  summarise(mean_per_day = mean(n_entries)) 
+mean(rr_stats$mean_per_day)
+sd(rr_stats$mean_per_day)
+range(response_rate$n_entries)
+```
+
+```{r}
+rr_days <- response_rate |>
+  group_by(ID) |>
+  summarise(n_days = n_distinct(Day), .groups = "drop")
+mean(rr_days$n_days)
+sd(rr_days$n_days)
+range(rr_days$n_days)
+```
+
+```{r}
+prop_6days <- rr_days %>%
+  summarise(
+    total_participants = n(),
+    at_least_6_days = sum(n_days >= 6),
+    proportion = at_least_6_days / total_participants
+  )
+```
+
+```{r}
+rr_total <- esm_traits_base |>
+  group_by(ID) |>
+  summarise(total_responses = n(), .groups = "drop")
+mean(rr_total$total_responses)
+sd(rr_total$total_responses)
+range(rr_total$total_responses)
+```
+
+```{r}
+nrow(esm_traits_base) / (n_unique(esm_traits_base$ID)*42)
+```
+
+```{r}
+ggplot(cesd_by_id, aes(CESD)) +
+  geom_histogram(binwidth = 1) +
+  labs(x = "Depression", y = "Frequency") +
+  theme_minimal()
+```
+
+```{r}
+cesd_dis <- cesd_by_id |>
+  describe_distribution()
+cesd_dis
+```
+
+```{r}
+traits_summary <- esm_traits_base |>
+  dplyr::distinct(ID, .keep_all = TRUE) |>
+  dplyr::select(AGE, GENDER, CESD) |>
+  gtsummary::tbl_summary(
+    statistic = list(
+      gtsummary::all_continuous() ~ "{mean} ({sd})",
+      gtsummary::all_categorical() ~ "{n} / {N} ({p}%)"
+    ),
+    digits = gtsummary::all_continuous() ~ 2
+  ) 
+traits_summary
+flextable_summary <- gtsummary::as_flex_table(traits_summary)
+flextable::save_as_rtf(flextable_summary, path = file.path("results","distr_tbl.rtf"))
+```
+
+```{r}
+participant_counts_only <- participant_counts %>%
+  left_join(cesd_by_id, by = "ID")|>
+  mutate(CESD_th = forcats::fct_relevel(CESD_th, "No", "Yes"),
+         C1_prop = forcats::fct_relevel(C1_prop, "Low", "High"),
+         ID = forcats::as_factor(ID) |> forcats::fct_drop())
+```
+
+```{r}
+# 1. Count unique participants per group
+counts_wide <- participant_counts_only %>%
+  dplyr::distinct(ID, CESD_th) %>%
+  dplyr::count(CESD_th) %>%
+  tidyr::pivot_wider(
+    names_from  = CESD_th,
+    values_from = n,
+    names_prefix = "n_"
+  ) %>%
+  mutate(n_Overall = n_No + n_Yes)
+```
+
+```{r}
+# 2. Get CESD summary stats
+cesd_summary <- participant_counts_only %>%
+  distinct(ID, CESD, CESD_th) %>%
+  summarise(
+    CESD_Overall_Mean = mean(CESD, na.rm = TRUE),
+    CESD_Overall_SD   = sd(CESD, na.rm = TRUE),
+    CESD_No_Mean      = mean(CESD[CESD_th == "No"], na.rm = TRUE),
+    CESD_No_SD        = sd(CESD[CESD_th == "No"], na.rm = TRUE),
+    CESD_Yes_Mean     = mean(CESD[CESD_th == "Yes"], na.rm = TRUE),
+    CESD_Yes_SD       = sd(CESD[CESD_th == "Yes"], na.rm = TRUE)
+  )
+```
+
+```{r}
+# 3. Proportion summary per C1_prop level
+prop_summary <- participant_counts_only %>%
+  group_by(C1_prop) %>%
+  summarise(
+    mean_Overall = mean(prop, na.rm = TRUE),
+    mean_No      = mean(prop[CESD_th == "No"],  na.rm = TRUE),
+    mean_Yes     = mean(prop[CESD_th == "Yes"], na.rm = TRUE),
+    .groups = "drop"
+  )
+```
+
+```{r}
+# 1. CESD summary — reshape to match structure
+cesd_summary_long <- cesd_summary %>%
+  mutate(
+    Measure        = "CESD",
+    C1_prop_Level  = ""
+  ) %>%
+  select(
+    Measure, C1_prop_Level,
+    Overall = CESD_Overall_Mean,
+    No      = CESD_No_Mean,
+    Yes     = CESD_Yes_Mean
+  )
+```
+
+```{r}
+# 2. prop_summary — reshape to same format
+prop_summary_long <- prop_summary %>%
+  mutate(
+    Measure = "C1_prop"
+  ) %>%
+  rename(C1_prop_Level = C1_prop) %>%
+  select(Measure, C1_prop_Level, 
+         Overall = mean_Overall,
+         No      = mean_No,
+         Yes     = mean_Yes)
+```
+
+```{r}
+# 3. Bind both summaries
+summary_combined <- bind_rows(cesd_summary_long, prop_summary_long)
+```
+
+```{r}
+# 4. Optional: round values
+summary_combined <- summary_combined %>%
+  mutate(across(c(Overall, No, Yes), ~ round(.x, 2)))
+gt_summary <- gt::gt(summary_combined) |>
+  gt::tab_spanner("Depression", columns = c(No, Yes))|>
+  gt::cols_label(Measure = "Characteristic", 
+                 C1_prop_Level = "")
+gt_summary
+```
+
+```{r}
+freq_summary <- esm_traits_base |>
+  group_by(ID) |>
+  gtsummary::tbl_summary(by = "CESD_th", include = c(CESD, C1_prop, Component_1),
+    statistic = list(
+      gtsummary::all_continuous() ~ "{mean} ({sd})",
+      gtsummary::all_categorical() ~ "{p}"
+    ),
+    digits = gtsummary::all_continuous() ~ 2,
+    missing = "no"
+  ) |> gtsummary::add_overall() |>
+  gtsummary::modify_spanning_header(c("stat_1", "stat_2") ~ "**Depression Group**") 
+freq_summary
+flextable_summary <- gtsummary::as_flex_table(freq_summary)
+flextable::save_as_rtf(flextable_summary, path = file.path("results", "freq_tbl.rtf"))
+```
+
+```{r}
+esm_traits %>%
+  group_by(ID) %>%
+  summarise(age = first(AGE)) %>%
+  summarise(mean_age = mean(age, na.rm = TRUE),
+            sd_age = sd(age, na.rm = TRUE))
+```
+
+```{r}
+esm_traits_base |> 
+  dplyr::group_by(ID) |>
+  dplyr::summarise(count = n()) |>
+  describe_distribution()
+```
+
+
