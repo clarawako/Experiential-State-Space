@@ -38,15 +38,24 @@ library(clue)
 library(cluster) # for kmedoids
 library(concaveman)
 library(factoextra)
+library(fmsb) # for radar plot
 ```
-
 # Custom functions
 
 ```{r}
-# FUNCTION TO FIT HMM MODEL FOR GIVEN K & SEED
-fit_hmm <- function(K, seed, data) {
+# ---- Helper functions (HMM fitting + summaries) ----
+# Dependencies used below:
+#   depmixS4::depmix(), depmixS4::fit()
+#   clue::solve_LSAP()
+
+# Fit a depmixS4 HMM with K states to 5 z-scored components.
+# Returns a fitted model object, or NULL if fitting fails.
+fit_hmm <- function(data, K, seed) {
+  stopifnot(is.data.frame(data), length(K) == 1, length(seed) == 1)
+
   set.seed(seed)
-  mod <- depmix(
+
+  mod <- depmixS4::depmix(
     response = list(
       Component_1_z ~ 1,
       Component_2_z ~ 1,
@@ -54,116 +63,136 @@ fit_hmm <- function(K, seed, data) {
       Component_4_z ~ 1,
       Component_5_z ~ 1
     ),
-    data = data,
+    data   = data,
     nstates = K,
-    family = rep(list(gaussian()), 5),
-    ntimes = as.numeric(table(data$ID))
+    family  = rep(list(gaussian()), 5),
+    # ntimes must be a vector giving the number of observations per subject
+    ntimes  = as.numeric(table(data$ID))
   )
-  fitted <- try(fit(mod, verbose = FALSE), silent = TRUE)
-  if (inherits(fitted, "try-error")) return(NA)
-  return(fitted)
+
+  fitted <- try(depmixS4::fit(mod, verbose = FALSE), silent = TRUE)
+  if (inherits(fitted, "try-error")) {
+    return(NULL)
+  }
+  fitted
 }
 ```
 ```{r}
-# FUNCTION TO EXTRACT STATE MEANS FROM OUTPUT
+# Extract per-state intercepts (means) for each observed variable.
+# Output: a matrix with dimensions [K x n_components]
 extract_state_means <- function(model) {
-  # Each state has 5 response models (one per component)
+  if (is.null(model)) return(NULL)
+
+  # model@response is a list of length K (states),
+  # each containing a list of response models (one per component).
   sapply(model@response, function(state_list) {
     sapply(state_list, function(r) r@parameters$coefficients)
   })
 }
 ```
 ```{r}
-# FUNCTION TO COMPARE STATES
+# Compute similarity (correlation) between two state-mean matrices.
+# Returns a K x K matrix: correlations between states in mat1 vs states in mat2.
 state_similarity <- function(mat1, mat2) {
-  cor(mat1, mat2)  # returns K × K matrix
+  stats::cor(mat1, mat2)
 }
 ```
 ```{r}
-# MATCH STATES
+# Solve best one-to-one state matching using the Hungarian algorithm.
+# Input: similarity matrix (K x K). Output: assignment vector of length K,
+# where assignment[i] is the matched column for row i.
 match_states <- function(sim_mat) {
-  sim_mat[is.na(sim_mat)] <- 0             # replace NAs
-  # convert to non-negative cost matrix
-  cost_mat <- 1 - sim_mat                  # cost ∈ [0, 2]
-  solve_LSAP(cost_mat)                     # Hungarian algorithm
+  sim_mat[is.na(sim_mat)] <- 0
+  cost_mat <- 1 - sim_mat  # convert similarity to cost
+  clue::solve_LSAP(cost_mat)
 }
 ```
 ```{r}
-# FUNCTION TO COMPUTE STABILITY OF STATES ACROSS K
+# Compute mean matched similarity across all pairs of fits for a given K.
+# dfK should contain a list-column 'state_means' with K-state mean matrices.
 compute_stability_for_K <- function(dfK) {
   mats <- dfK$state_means
   n <- length(mats)
+
+  if (n < 2) return(NA_real_)
+
   sims <- c()
-  for (i in 1:(n-1)) {
-    for (j in (i+1):n) {
+
+  for (i in 1:(n - 1)) {
+    for (j in (i + 1):n) {
       if (is.matrix(mats[[i]]) && is.matrix(mats[[j]])) {
-        S <- cor(mats[[i]], mats[[j]])
+
+        S <- stats::cor(mats[[i]], mats[[j]])
         S[is.na(S)] <- 0
+
         assignment <- match_states(S)
-        matched <- S[cbind(1:ncol(S), assignment)]
+        matched <- S[cbind(seq_len(ncol(S)), assignment)]
         sims <- c(sims, mean(matched))
       }
     }
   }
+
+  if (length(sims) == 0) return(NA_real_)
   mean(sims)
 }
 ```
-
+## HMM dynamics functions
 ```{r}
-# FUNCTION TO COMPUTE SWITCHING RATE IN A VECTOR OF STATES
+# Switching rate: proportion of adjacent timepoints where state changes.
 switching_rate <- function(states) {
   if (length(states) < 2) return(NA_real_)
-  mean(diff(states) != 0)  # proportion of times state changes
+  mean(diff(states) != 0)
 }
 ```
 
 ```{r}
-# FUNCTION TO COMPUTE TRANSITION PROBABILITIES WITH SELF TRANSITIONS
+# Transition probability matrix (TPM) including self-transitions.
+# Rows sum to 1 (unless a state is never visited; those rows become 0).
 compute_tpm <- function(states, n_states) {
-  # Create transition count matrix
-  tpm_counts <- matrix(0, nrow = n_states, ncol = n_states)
-  rownames(tpm_counts) <- paste0("S", 1:n_states)
-  colnames(tpm_counts) <- paste0("S", 1:n_states)
+  tpm_counts <- matrix(0, nrow = n_states, ncol = n_states,
+                       dimnames = list(paste0("S", 1:n_states), paste0("S", 1:n_states)))
+
   for (i in 1:(length(states) - 1)) {
     from <- states[i]
-    to <- states[i + 1]
+    to   <- states[i + 1]
     if (!is.na(from) && !is.na(to)) {
       tpm_counts[from, to] <- tpm_counts[from, to] + 1
     }
   }
-  # Convert to probabilities (row-wise)
+
   row_sums <- rowSums(tpm_counts)
   tpm_probs <- sweep(tpm_counts, 1, row_sums, FUN = "/")
   tpm_probs[is.na(tpm_probs)] <- 0
-  return(tpm_probs)
+  tpm_probs
 }
 ```
 ```{r}
-## FUNCTION TO COMPUTE TRANISTION PROBABILITIES WITHOUT SELF TRANSITIONS
-compute_tpm_secondary <- function(states, n_states) {
-  # Transition count matrix
-  tpm_counts <- matrix(0, nrow = n_states, ncol = n_states)
-  rownames(tpm_counts) <- paste0("S", 1:n_states)
-  colnames(tpm_counts) <- paste0("S", 1:n_states)
-  for (i in 1:(length(states)-1)) {
+# Transition probability matrix excluding self-transitions.
+# Diagonal entries are forced to 0, and rows are renormalised on off-diagonal counts.
+compute_tpm_no_self <- function(states, n_states) {
+  tpm_counts <- matrix(0, nrow = n_states, ncol = n_states,
+                       dimnames = list(paste0("S", 1:n_states), paste0("S", 1:n_states)))
+
+  for (i in 1:(length(states) - 1)) {
     from <- states[i]
-    to <- states[i + 1]
+    to   <- states[i + 1]
     if (!is.na(from) && !is.na(to)) {
       tpm_counts[from, to] <- tpm_counts[from, to] + 1
     }
   }
-  # Remove self-transitions (set diagonals to 0)
+
   diag(tpm_counts) <- 0
-  # Convert to probabilities row-wise (renormalised on off-diagonal counts only)
+
   row_sums <- rowSums(tpm_counts)
   tpm_probs <- sweep(tpm_counts, 1, row_sums, FUN = "/")
   tpm_probs[is.na(tpm_probs)] <- 0
-  return(tpm_probs)
+  tpm_probs
 }
 ```
 
 ```{r}
-# Helper function to get pretty label
+# Pretty label lookup for components (requires 'component_labels' data frame
+# with columns: Component, Label).
 get_label <- function(comp_name) {
   component_labels$Label[component_labels$Component == comp_name]
 }
@@ -590,31 +619,30 @@ ggsave(
 ```{r}
 esm_hmm <- esm_centroids |>
   filter(Stimulus_Type == "Baseline") |>
-  arrange(ID, Date) %>%
+  arrange(ID, Date) |>
   dplyr::select(ID, Date, Component_1_z:Component_5_z) 
 ```
 
 ```{r}
-# SETTINGS
+# ---- Fit HMMs across K values and random seeds ----
+
 K_values <- 2:5
 seeds    <- 1:20
-```
 
-```{r}
-# RUN ALL MODELS
 results <- expand.grid(K = K_values, seed = seeds) %>%
   mutate(
-    model = map2(K, seed, ~ fit_hmm(.x, .y, esm_hmm)),
+    # fit_hmm(data, K, seed) returns a fitted model or NULL if fitting fails
+    model = map2(K, seed, ~ fit_hmm(data = esm_hmm, K = .x, seed = .y)),
+    # Extract log-likelihood (NA if model failed)
     logLik = map_dbl(model, function(m) {
-      if (inherits(m, "try-error") || is.null(m)) return(NA_real_)
-      as.numeric(logLik(m))
-    })
-  )
+      if (is.null(m)) return (NA_real_)
+      as.numeric(logLik(m))}
+      ))
 
 ```
 
 ```{r}
-# Plot log-lik for each K
+# Plot log-likelihood as a function of K
 k_log_plot <- ggplot(results, aes(x = K, y = logLik)) +
   stat_summary(fun = mean, geom = "line", linewidth = 1) +
   stat_summary(fun.data = mean_cl_normal, geom = "errorbar", width = 0.1) +
@@ -628,31 +656,30 @@ ggsave(
   filename = file.path(results_path, "k_log_plot.png"),
   plot     = k_log_plot,
   units    = "mm",
-  width = 700,
-  height = 320,
+  width    = 220,
+  height   = 110,
   dpi   = 300
 )
 ```
 
 
 ```{r}
-# Extract state maps
+# Extract per-state mean maps
+# These are used to assess whether state solutions are consistent across random seeds.
 results <- results |>
   mutate(
-    state_means = map(model, ~ {
-      if (!inherits(.x, "try-error")) {
-        extract_state_means(.x)
-      } else {
-        NA
-      }
-    })
-  )
+    state_means = map(model, extract_state_means))
 ```
 ```{r}
-# Compute and plot stability of states as the average similarity between state maps obtained from models trained with different random initialisations.
-stability_scores <- results %>%
-  group_by(K) %>%
-  dplyr::summarise(stability = compute_stability_for_K(cur_data()))
+# Compute cross-seed stability for each K
+# Stability is the average matched correlation between state-mean maps across all seed pairs.
+
+stability_scores <- results |>
+  dplyr::group_by(K) |>
+  dplyr::summarise(
+    stability = compute_stability_for_K(dplyr::pick(everything())),
+    .groups = "drop"
+  )
 
 state_stability_plot <- ggplot(stability_scores, aes(K, stability)) +
   geom_point(size = 4) +
@@ -662,60 +689,39 @@ state_stability_plot <- ggplot(stability_scores, aes(K, stability)) +
     x = "Number of HMM states (K)",
     y = "Cross-seed state map stability"
   )
+
 ggsave(
   filename = file.path(results_path, "state_stability.png"),
   plot     = state_stability_plot,
   units    = "mm",
-  width = 700,
-  height = 320,
+  width    = 220,
+  height   = 110,
   dpi   = 300
 )
 ```
 
 
 ```{r}
-# Now we keep only one model K =3
-nstates = 3
+# Now we keep only one model, here K =3
+final_K <- 3
 
-build_model <- function(startseed) {
-  set.seed(startseed)
-  mod <- depmix(response = list(
-    Component_1_z ~ 1,
-    Component_2_z ~ 1,
-    Component_3_z ~ 1,
-    Component_4_z ~ 1,
-    Component_5_z ~ 1),
-    data = esm_hmm,
-    nstates = nstates,
-    family = rep(list(gaussian()), 5),
-    ntimes = as.numeric(table(esm_hmm$ID)))
-  fit(mod, verbose = FALSE)
+best_row <- results |>
+  dplyr::filter(K == final_K) |>
+  dplyr::arrange(dplyr::desc(logLik)) |>
+  dplyr::slice(1)
+
+fitted_mod <- best_row$model[[1]]
+best_model_seed <- best_row$seed[[1]]
+
+if (is.null(fitted_mod)) {
+  stop("All model fits failed for final_K = ", final_K, ". Try more seeds or check the data.")
 }
-```
 
-```{r}
-# Try multiple seeds to see consistency across initiations
-seeds <- 1:20 # K=2: 12, K=3: 19, K= 4: 11,  K=5: 16
-models <- lapply(seeds, build_model)
-```
-
-```{r}
-# Compare log-likelihoods
-log_liks <- sapply(models, logLik)
-```
-```{r}
-# Pick the best model
-best_index <- which.max(log_liks)
-```
-
-```{r}
-# Extract the best model and its seed
-best_model <- models[[best_index]]
-best_model_seed <- seeds[best_index]
-AIC(best_model)
-BIC(best_model)
-logLik(best_model)
-fitted_mod <- best_model
+# Report fit statistics for the selected model
+AIC(fitted_mod)
+BIC(fitted_mod)
+logLik(fitted_mod)
+best_model_seed
 ```
 
 ```{r}
@@ -725,6 +731,7 @@ model_summary <- suppressMessages(capture.output(summary_obj <- summary(fitted_m
 state_table <- as.data.frame(summary_obj)
 ```
 ```{r}
+# Extract state mean maps for plotting
 # Keep only columns with intercepts (means), e.g., "Re1.(Intercept)", "Re2.(Intercept)", etc.
 mean_cols <- grep("\\.\\(Intercept\\)", names(state_table), value = TRUE)
 ```
@@ -748,13 +755,14 @@ state_means <- state_means |>
 
 ```{r}
 # Demean weights within each state (row-wise centering)
-state_means_demeaned <- state_means %>%
-  rowwise() %>%
+state_means_demeaned <- state_means |>
+  rowwise() |>
   mutate(across(starts_with("Component"),
-                ~ .x - mean(c_across(starts_with("Component"))))) %>%
+                ~ .x - mean(c_across(starts_with("Component"))))) |>
   ungroup()
-# Raw state weights
-state_means_raw <- state_means %>%
+
+# Raw state weights, long format
+state_means_raw <- state_means |>
   pivot_longer(cols = starts_with("Component"),
                names_to = "Component",
                values_to = "Weight") |>
@@ -783,6 +791,7 @@ state_composition <- ggplot(state_means_raw, aes(x = Component, y = State, fill 
     legend.text = element_text(size = 20),
     axis.text = element_text(size = 20)
   )
+
 ggsave(
   filename = file.path(results_path, "state_composition.svg"),
   plot     = state_composition,   
@@ -1093,62 +1102,66 @@ pairs <- combn(geom_vars, 2, simplify = FALSE)
 ```{r}
 # Compute convex hull per cluster (the outline of the cloud)
 # convex hull algorithm
+## TODO: FIX 
 
-# ---- Loop over each pair ----
-for (pair in pairs) {
-  x_var <- pair[1]
-  y_var <- pair[2]
-  x_lab <- get_label(x_var)
-  y_lab <- get_label(y_var)
-  cluster_hulls <- centroid_dep %>%
-    filter(cluster_med %in% c(1,2)) %>%
-    group_by(cluster_med) %>%
-    do({
-      # extract numeric matrix (NO tibble!)
-      pts <- as.matrix(select(., Geom_1, Geom_2, Geom_3, Geom_4, Geom_5))
-      # concaveman requires a matrix of xy coordinates
-      hull <- concaveman(pts)
-      # concaveman returns a matrix → convert to df & add cluster label
-      hull_df <- as.data.frame(hull)
-      names(hull_df) <- c("Geom_1", "Geom_2", "Geom_3", "Geom_4", "Geom_5")
-      hull_df$cluster_med <- unique(.$cluster_med)
-      hull_df
-    }) %>%
-    ungroup()
-  # Build plot
-  p <- ggplot() +
-    geom_polygon(
-      data = cluster_hulls,
-      aes(x = .data[[x_var]], y = .data[[y_var]], fill = cluster_med, group = cluster_med),
-      alpha = 0.08, colour = NA
-    ) +
-    geom_path(
-      data = cluster_hulls,
-      aes(x = .data[[x_var]], y = .data[[y_var]], colour = cluster_med, group = cluster_med),
-      linewidth = 1.1
-    ) +
-    scale_fill_brewer(palette = "Dark2", name = "Cluster", labels = c("Reference", "Cluster of interest")) +
-    scale_color_brewer(palette = "Dark2", guide = "none") +
-    ggnewscale::new_scale_color() +
-    geom_point(
-      data = centroid_dep %>% filter(cluster_med %in% c(1,2)),
-      aes(x = .data[[x_var]], y = .data[[y_var]], color = CESD_stnd),
-      size = 2, alpha = 0.8
-    ) +
-    scale_color_gradient(
-      low = "#0b6ac8", high = "#cc0000",
-      limits = c(-0.77872644, 0.4712813),
-      oob = scales::squish,
-      name = "Depression"
-    ) +
-    labs(x = x_lab, y = y_lab) +
-    theme_minimal(base_size = 16)
-  # #Save file
-  # filename <- paste0(/results/cluster_new", x_var, "_", y_var, ".svg")
-  # ggsave(filename, p, width = 7, height = 6, dpi = 300)
-  # 
-  # message("Saved: ", filename)
-}
+# # ---- Loop over each pair ----
+# for (pair in pairs) {
+#   x_var <- pair[1]
+#   y_var <- pair[2]
+#   x_lab <- get_label(x_var)
+#   y_lab <- get_label(y_var)
+#   cluster_hulls <- centroid_dep %>%
+#     filter(cluster_med %in% c(1,2)) %>%
+#     group_by(cluster_med) %>%
+#     do({
+#       # extract numeric matrix (NO tibble)
+#       pts <- as.matrix(select(., Geom_1, Geom_2, Geom_3, Geom_4, Geom_5))
+#       
+#       # concaveman requires a matrix of xy coordinates
+#       hull <- concaveman(pts)
+#       
+#       # concaveman returns a matrix → convert to df & add cluster label
+#       hull_df <- as.data.frame(hull)
+#       names(hull_df) <- c("Geom_1", "Geom_2", "Geom_3", "Geom_4", "Geom_5")
+#       hull_df$cluster_med <- unique(.$cluster_med)
+#       hull_df
+#     }) %>%
+#     ungroup()
+#   
+#   # Build plot
+#   p <- ggplot() +
+#     geom_polygon(
+#       data = cluster_hulls,
+#       aes(x = .data[[x_var]], y = .data[[y_var]], fill = cluster_med, group = cluster_med),
+#       alpha = 0.08, colour = NA
+#     ) +
+#     geom_path(
+#       data = cluster_hulls,
+#       aes(x = .data[[x_var]], y = .data[[y_var]], colour = cluster_med, group = cluster_med),
+#       linewidth = 1.1
+#     ) +
+#     scale_fill_brewer(palette = "Dark2", name = "Cluster", labels = c("Reference", "Cluster of interest")) +
+#     scale_color_brewer(palette = "Dark2", guide = "none") +
+#     ggnewscale::new_scale_color() +
+#     geom_point(
+#       data = centroid_dep %>% filter(cluster_med %in% c(1,2)),
+#       aes(x = .data[[x_var]], y = .data[[y_var]], color = CESD_stnd),
+#       size = 2, alpha = 0.8
+#     ) +
+#     scale_color_gradient(
+#       low = "#0b6ac8", high = "#cc0000",
+#       limits = c(-0.77872644, 0.4712813),
+#       oob = scales::squish,
+#       name = "Depression"
+#     ) +
+#     labs(x = x_lab, y = y_lab) +
+#     theme_minimal(base_size = 16)
+#   # #Save file
+#   # filename <- paste0(/results/cluster_new", x_var, "_", y_var, ".svg")
+#   # ggsave(filename, p, width = 7, height = 6, dpi = 300)
+#   # 
+#   # message("Saved: ", filename)
+# }
 ```
 
 # Distance analysis
@@ -1174,6 +1187,7 @@ esm_stim_cent <- esm_centroids |>
 
 ```{r}
 cols <- c("Positive" = "#cc0000", "Negative" = "#0c60ac", "Baseline" = "#444444")
+
 violin_distance <- ggplot(esm_stim_cent, aes(x = Condition, y = Radius_geom, fill = Condition)) +
   geom_violin(position = position_dodge(width = 0.9), width = 0.8, alpha = 0.6, show.legend = FALSE) +
   geom_boxplot(position = position_dodge(width = 0.9), width = 0.1, color = "#444444", alpha = 0.2, show.legend = FALSE) +
@@ -1360,7 +1374,7 @@ min_row$Condition <- "Min"
 ```{r}
 # Bind all together
 radar_dir <- bind_rows(max_row, min_row, direction_radar)
-png(file.path("results","radar_plot_displacement.png"), width = 1200, height = 1000, res = 300)
+png(file.path(results_path,"radar_plot_displacement.png"), width = 1200, height = 1000, res = 300)
 ```
 
 ```{r}
@@ -1387,15 +1401,11 @@ radarchart(radar_dir|> dplyr::select(-Condition),
            vlcex = 0.8)
 legend(x = "bottomright", title = "Condition", legend = c("Positive", "Negative"),
        bty = "n", pch = 20, col = colors_border, text.col = "black", cex = 1, pt.cex = 2)
-```
-```{r}
 # Reset plotting parameters
 par(op)
 ```
 
-
 # Mood Model
-
 
 ```{r}
 esm_traits_z <- esm_traits_z |>
@@ -1466,7 +1476,7 @@ estimate_contrasts(mood_depression_mdl, contrast = "Stimulus_Type", by="CESD_stn
 # Cronback's alpha
 
 ```{r}
-traits <- read.csv(file.path("results", "Combined_traits.csv"))|> 
+traits <- read.csv(file.path(dirname(getwd()),"data", "Combined_traits.csv"))|> 
   dplyr::mutate(ID = forcats::as_factor(ID))
 ```
 
@@ -1565,7 +1575,7 @@ traits_summary <- esm_traits_base |>
   ) 
 traits_summary
 flextable_summary <- gtsummary::as_flex_table(traits_summary)
-flextable::save_as_rtf(flextable_summary, path = file.path("results","distr_tbl.rtf"))
+flextable::save_as_rtf(flextable_summary, path = file.path(results_path,"distr_tbl.rtf"))
 ```
 
 ```{r}
@@ -1622,7 +1632,7 @@ cesd_summary_long <- cesd_summary %>%
     Measure        = "CESD",
     C1_prop_Level  = ""
   ) %>%
-  select(
+  dplyr::select(
     Measure, C1_prop_Level,
     Overall = CESD_Overall_Mean,
     No      = CESD_No_Mean,
@@ -1637,7 +1647,7 @@ prop_summary_long <- prop_summary %>%
     Measure = "C1_prop"
   ) %>%
   rename(C1_prop_Level = C1_prop) %>%
-  select(Measure, C1_prop_Level, 
+  dplyr::select(Measure, C1_prop_Level, 
          Overall = mean_Overall,
          No      = mean_No,
          Yes     = mean_Yes)
@@ -1671,9 +1681,11 @@ freq_summary <- esm_traits_base |>
     missing = "no"
   ) |> gtsummary::add_overall() |>
   gtsummary::modify_spanning_header(c("stat_1", "stat_2") ~ "**Depression Group**") 
+
 freq_summary
+
 flextable_summary <- gtsummary::as_flex_table(freq_summary)
-flextable::save_as_rtf(flextable_summary, path = file.path("results", "freq_tbl.rtf"))
+flextable::save_as_rtf(flextable_summary, path = file.path(results_path, "freq_tbl.rtf"))
 ```
 
 ```{r}
