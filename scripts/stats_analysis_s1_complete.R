@@ -1,40 +1,181 @@
-#' ---
-#' title: "mood_interaction"
-#' format: html
-#' editor: visual
-#' ---
-#' 
-## ----------------------------------------------------------------------------------------------------------------
+## ---------------------------------------------------------------------------------------------------------------------
+# ---- Packages ----
+# Data wrangling + plotting
 library(tidyverse)
-library(easystats)
+
+# Mixed models
 library(lme4)
-#library(nlme)
-library(dplyr)
-library(glmmTMB) # for beta and binomial regressions
-library(ggeffects)
-#library(MASS)
-library(psych)
-library(influence.ME)
-library(ggside)
-library(matrixStats)  # for rowMedians
-library(pdist)        # for distance matrices
-library(pracma) #for geometric median
-#library(fmsb)
-#library(nnet)
-#library(lsa)   # for cosine()
-library(tidyr)
-library(depmixS4) # for HMMs
+library(glmmTMB)
+library(modelbased)
+
+# # Model summaries / tidying / prediction
 library(broom)
-library(mutoss)
-library(clue)
-library(cluster) # for kmedoids
-library(concaveman)
-library(factoextra)
-#' 
-#' # Load the data
-#' 
-## ----------------------------------------------------------------------------------------------------------------
-data_path <- file.path("data", "master.csv")
+library(broom.mixed)
+
+# HMMs + matching
+library(depmixS4)
+
+# # Distances / geometry / clustering / visualisation (load only if used)
+library(pracma)        # geo_median
+library(cluster)       # pam() 
+library(concaveman)    # concave hull
+
+# Plot extras
+library(ggside)
+
+
+## ---------------------------------------------------------------------------------------------------------------------
+# ---- Helper functions (HMM fitting + summaries) ----
+# Dependencies used below:
+#   depmixS4::depmix(), depmixS4::fit()
+#   clue::solve_LSAP()
+
+# Fit a depmixS4 HMM with K states to 5 z-scored components.
+# Returns a fitted model object, or NULL if fitting fails.
+fit_hmm <- function(data, K, seed) {
+  stopifnot(is.data.frame(data), length(K) == 1, length(seed) == 1)
+
+  set.seed(seed)
+
+  mod <- depmixS4::depmix(
+    response = list(
+      Component_1_z ~ 1,
+      Component_2_z ~ 1,
+      Component_3_z ~ 1,
+      Component_4_z ~ 1,
+      Component_5_z ~ 1
+    ),
+    data   = data,
+    nstates = K,
+    family  = rep(list(gaussian()), 5),
+    # ntimes must be a vector giving the number of observations per subject
+    ntimes  = as.numeric(table(data$ID))
+  )
+
+  fitted <- try(depmixS4::fit(mod, verbose = FALSE), silent = TRUE)
+  if (inherits(fitted, "try-error")) {
+    return(NULL)
+  }
+  fitted
+}
+
+## ---------------------------------------------------------------------------------------------------------------------
+# Extract per-state intercepts (means) for each observed variable.
+# Output: a matrix with dimensions [K x n_components]
+extract_state_means <- function(model) {
+  if (is.null(model)) return(NULL)
+
+  # model@response is a list of length K (states),
+  # each containing a list of response models (one per component).
+  sapply(model@response, function(state_list) {
+    sapply(state_list, function(r) r@parameters$coefficients)
+  })
+}
+
+
+## ---------------------------------------------------------------------------------------------------------------------
+# Solve best one-to-one state matching using the Hungarian algorithm.
+# Input: similarity matrix (K x K). Output: assignment vector of length K,
+# where assignment[i] is the matched column for row i.
+match_states <- function(sim_mat) {
+  sim_mat[is.na(sim_mat)] <- 0
+  cost_mat <- 1 - sim_mat  # convert similarity to cost
+  clue::solve_LSAP(cost_mat)
+}
+
+## ---------------------------------------------------------------------------------------------------------------------
+# Compute mean matched similarity across all pairs of fits for a given K.
+# dfK should contain a list-column 'state_means' with K-state mean matrices.
+compute_stability_for_K <- function(dfK) {
+  mats <- dfK$state_means
+  n <- length(mats)
+
+  if (n < 2) return(NA_real_)
+
+  sims <- c()
+
+  for (i in 1:(n - 1)) {
+    for (j in (i + 1):n) {
+      if (is.matrix(mats[[i]]) && is.matrix(mats[[j]])) {
+
+        S <- stats::cor(mats[[i]], mats[[j]])
+        S[is.na(S)] <- 0
+
+        assignment <- match_states(S)
+        matched <- S[cbind(seq_len(ncol(S)), assignment)]
+        sims <- c(sims, mean(matched))
+      }
+    }
+  }
+
+  if (length(sims) == 0) return(NA_real_)
+  mean(sims)
+}
+
+
+## ---------------------------------------------------------------------------------------------------------------------
+# Switching rate: proportion of adjacent timepoints where state changes.
+switching_rate <- function(states) {
+  if (length(states) < 2) return(NA_real_)
+  mean(diff(states) != 0)
+}
+
+
+## ---------------------------------------------------------------------------------------------------------------------
+# Transition probability matrix (TPM) including self-transitions.
+# Rows sum to 1 (unless a state is never visited; those rows become 0).
+compute_tpm <- function(states, n_states) {
+  tpm_counts <- matrix(0, nrow = n_states, ncol = n_states,
+                       dimnames = list(paste0("S", 1:n_states), paste0("S", 1:n_states)))
+
+  for (i in 1:(length(states) - 1)) {
+    from <- states[i]
+    to   <- states[i + 1]
+    if (!is.na(from) && !is.na(to)) {
+      tpm_counts[from, to] <- tpm_counts[from, to] + 1
+    }
+  }
+
+  row_sums <- rowSums(tpm_counts)
+  tpm_probs <- sweep(tpm_counts, 1, row_sums, FUN = "/")
+  tpm_probs[is.na(tpm_probs)] <- 0
+  tpm_probs
+}
+
+## ---------------------------------------------------------------------------------------------------------------------
+# Transition probability matrix excluding self-transitions.
+# Diagonal entries are forced to 0, and rows are renormalised on off-diagonal counts.
+compute_tpm_no_self <- function(states, n_states) {
+  tpm_counts <- matrix(0, nrow = n_states, ncol = n_states,
+                       dimnames = list(paste0("S", 1:n_states), paste0("S", 1:n_states)))
+
+  for (i in 1:(length(states) - 1)) {
+    from <- states[i]
+    to   <- states[i + 1]
+    if (!is.na(from) && !is.na(to)) {
+      tpm_counts[from, to] <- tpm_counts[from, to] + 1
+    }
+  }
+
+  diag(tpm_counts) <- 0
+
+  row_sums <- rowSums(tpm_counts)
+  tpm_probs <- sweep(tpm_counts, 1, row_sums, FUN = "/")
+  tpm_probs[is.na(tpm_probs)] <- 0
+  tpm_probs
+}
+
+
+## ---------------------------------------------------------------------------------------------------------------------
+# Pretty label lookup for components (requires 'component_labels' data frame
+# with columns: Component, Label).
+get_label <- function(comp_name) {
+  component_labels$Label[component_labels$Component == comp_name]
+}
+
+
+## ---------------------------------------------------------------------------------------------------------------------
+data_path <- file.path(dirname(getwd()), "data", "master.csv")
 
 if (!file.exists(data_path)) {
   stop("Dataset is currently not publicaly available.")
@@ -45,166 +186,177 @@ esm_traits <- read.csv(data_path) |>
                 Stimulus_Type = forcats::fct_relevel(Stimulus_Type, "Baseline", "pos", "neg"), 
                 GENDER = ifelse(GENDER == 1,"Female", "Male"))
 
-#' 
-## ----------------------------------------------------------------------------------------------------------------
+
+## ---------------------------------------------------------------------------------------------------------------------
 # Count number of participants
 filtered_id <- esm_traits |> 
   dplyr::group_by(ID) |>
   dplyr::summarise(count = n())
-#' 
-## ----------------------------------------------------------------------------------------------------------------
+
+
+## ---------------------------------------------------------------------------------------------------------------------
 # Count number of participants by Gender group
 esm_traits |> 
   dplyr::distinct(ID, GENDER) |>  # Keep only one row per ID-GENDER pair
   dplyr::count(GENDER) 
-#' 
-## ----------------------------------------------------------------------------------------------------------------
+
+
+## ---------------------------------------------------------------------------------------------------------------------
 cesd_by_id <- esm_traits |>
   dplyr::select(ID, CESD_stnd, CESD, AGE, GENDER) |>
   distinct(ID, .keep_all = TRUE)
-#' 
-#' Standardise 
-component_cols <- c("Component_1", "Component_2", "Component_3", "Component_4", "Component_5")
 
-esm_traits_z <- esm_traits %>%
+## ---------------------------------------------------------------------------------------------------------------------
+# create path string to save results to 
+results_path <- file.path(dirname(getwd()), "results")
+
+
+## ---------------------------------------------------------------------------------------------------------------------
+component_cols <- c("Component_1", "Component_2", "Component_3", "Component_4", "Component_5")
+esm_traits_z <- esm_traits |>
   mutate(across(
     all_of(component_cols),
     ~ (.x - mean(.x, na.rm = TRUE)) / sd(.x, na.rm = TRUE),
     .names = "{.col}_z"
   )) 
-## ----------------------------------------------------------------------------------------------------------------
+
+
+## ---------------------------------------------------------------------------------------------------------------------
 # Filter Condition to only include everyday life (session 3) data
 esm_traits_base <- esm_traits_z |> 
   dplyr::filter(Stimulus_Type == "Baseline") |>
   dplyr::mutate(ID = droplevels(ID))
-#' 
-#' Emotional Manipulation check
-## ----------------------------------------------------------------------------------------------------------------
+
+
+## ---------------------------------------------------------------------------------------------------------------------
 affective_summary <- esm_traits_z |>
 group_by(Stimulus_Type) |>
   datawizard::describe_distribution(Positive)
-
 affective_test <- lme4::lmer(Positive_stnd ~ Stimulus_Type + (1|ID), data = esm_traits_z)
 summary(affective_test)
-
 parameters::parameters(affective_test)
-#'
-#'Establish default thought patterns: calculate for each participant the geometric median of their observations
-## ----------------------------------------------------------------------------------------------------------------
-centroid_summary <- esm_traits_z %>%
-  filter(Stimulus_Type == "Baseline") %>%
-  dplyr::select(ID, Component_1_z:Component_5_z) %>%
-  group_by(ID) %>%
-  group_split() %>%
+
+
+## ---------------------------------------------------------------------------------------------------------------------
+centroid_summary <- esm_traits_z |>
+  filter(Stimulus_Type == "Baseline") |>
+  dplyr::select(ID, Component_1_z:Component_5_z) |>
+  group_by(ID) |>
+  group_split() |>
   map_dfr(function(df) {
-    comp_matrix <- df %>%
-      dplyr::select(Component_1_z:Component_5_z) %>%
-      drop_na() %>%
+    comp_matrix <- df |>
+      dplyr::select(Component_1_z:Component_5_z) |>
+      drop_na() |>
       as.matrix()
-    
     geom_vec   <- geo_median(comp_matrix)$p  
-    
     tibble(
       ID = unique(df$ID),
       !!!set_names(as.list(geom_vec),   paste0("Geom_",   1:5))
     )
   })
 
+
+## ---------------------------------------------------------------------------------------------------------------------
 # Join the geometric medians to the esm data
 esm_centroids <- esm_traits_z |>
   left_join(centroid_summary, by = "ID")
 
+
+## ---------------------------------------------------------------------------------------------------------------------
 # Calculate the distance for each observation to the geometric median
-esm_centroids <- esm_centroids %>%
-  rowwise() %>%
+esm_centroids <- esm_centroids |>
+  rowwise() |>
   mutate(
     Radius_geom = {
       comps <- c_across(Component_1_z:Component_5_z)
       geom_cent <- c_across(Geom_1:Geom_5)
       sqrt(sum((comps - geom_cent)^2))
     }
-  ) %>%
+  ) |>
   ungroup() |>
   mutate(AGE_stnd = scale(AGE), 
          GENDER = as_factor(GENDER))
-#'
-#'
-#'Similarity analysis: 
-#compute within vs between participant thought similarity. 
-#Then run a permutation test to see if within vs between participant thought are significantly different or chance
 
+
+## ---------------------------------------------------------------------------------------------------------------------
 participant_ids <- unique(esm_traits_base$ID)
 
+
+## ---------------------------------------------------------------------------------------------------------------------
 # Create an empty data frame to store results
 within_similarity_df <- data.frame(ID = character(), within_similarity_z = numeric(), stringsAsFactors = FALSE)
 
+
+## ---------------------------------------------------------------------------------------------------------------------
 # Loop over each participant ID
 for (id in participant_ids) {
-  
   # Subset data for the current participant
-  participant_data <- esm_traits_base %>%
-    dplyr::filter(ID == id) %>%
+  participant_data <- esm_traits_base |>
+    dplyr::filter(ID == id) |>
     dplyr::select(c("Component_1_z":"Component_5_z"))
-  
   # Convert to matrix
   participant_matrix <- as.matrix(participant_data)
-  
   # Only proceed if participant has more than 1 measurement
   if (nrow(participant_matrix) > 1) {
-    
     # Compute trial × trial correlation
     trial_cor <- cor(t(participant_matrix))
-    
     # Extract lower triangle
     lower_vals <- trial_cor[lower.tri(trial_cor)]
-    
     #Fisher transform correlations before averaging
     lower_vals_clipped <- pmin(pmax(lower_vals, -0.9999), 0.9999)
     z_vals <- atanh(lower_vals_clipped)
-    
     # Compute mean z-value
     mean_z <- mean(z_vals, na.rm = TRUE)
-    
     # Add result to the data frame
     within_similarity_df <- rbind(within_similarity_df, data.frame(ID = id, within_similarity_z = mean_z))
   }
 }
-
 mean_within_similarity <- mean(within_similarity_df$within_similarity_z)
 
-# Between subject similarity
-mean_vectors <- esm_traits_base %>%
-  group_by(ID) %>%
-  summarise(across(c("Component_1_z":"Component_5_z"), \(x) mean(x, na.rm = TRUE))) %>%
-  ungroup()
 
+## ---------------------------------------------------------------------------------------------------------------------
+# Between subject similarity
+mean_vectors <- esm_traits_base |>
+  group_by(ID) |>
+  summarise(across(c("Component_1_z":"Component_5_z"), \(x) mean(x, na.rm = TRUE))) |>
+  ungroup()
 mean_matrix <- as.matrix(mean_vectors[, -1])
 
+
+## ---------------------------------------------------------------------------------------------------------------------
 # Correlation matrix 
 between_cor <- cor(t(mean_matrix))
 
+
+## ---------------------------------------------------------------------------------------------------------------------
 # extract lower triangle
 lower_between <- between_cor[lower.tri(between_cor)]
 
+
+## ---------------------------------------------------------------------------------------------------------------------
 # Fisher z
 z_between <- atanh(lower_between)
 mean_between_similarity <- mean(z_between, na.rm = TRUE)
-
 within_z <- within_similarity_df$within_similarity_z
 between_z <- z_between  # the full lower triangle of between-subject correlations, Fisher-z transformed
 
+
+## ---------------------------------------------------------------------------------------------------------------------
 # Compute the observed difference
 observed_diff <- mean(within_z) - mean(between_z)
 
+
+## ---------------------------------------------------------------------------------------------------------------------
 # Combine all values into one vector
 all_z_values <- c(within_z, between_z)
 group_labels <- c(rep("within", length(within_z)), rep("between", length(between_z)))
 
+
+## ---------------------------------------------------------------------------------------------------------------------
 # Set number of permutations
 n_perm <- 10000
 perm_diffs <- numeric(n_perm)
 set.seed(123)
-
 for (i in 1:n_perm) {
   shuffled_labels <- sample(group_labels)
   group1 <- all_z_values[shuffled_labels == "within"]
@@ -212,15 +364,18 @@ for (i in 1:n_perm) {
   perm_diffs[i] <- mean(group1) - mean(group2)
 }
 
+
+## ---------------------------------------------------------------------------------------------------------------------
 # p-value: how often is permuted diff ≥ observed diff?
 p_value <- mean(perm_diffs >= observed_diff)
-
 perm_df <- data.frame(perm_diff = perm_diffs)
 
+
+## ---------------------------------------------------------------------------------------------------------------------
 # Make the plot
 permutation_plot <- ggplot(perm_df, aes(x = perm_diff)) +
   geom_histogram(bins = 50, fill = "grey80", color = "black") +
-  geom_vline(xintercept = observed_diff, color = "#990000", size = 1.2) +
+  geom_vline(xintercept = observed_diff, color = "#990000", linewidth = 1.2) +
   annotate("text",
            x = Inf,
            y = Inf,
@@ -239,7 +394,6 @@ permutation_plot <- ggplot(perm_df, aes(x = perm_diff)) +
     panel.grid.minor     = element_blank(),
     axis.line            = element_line(color = "black"),
     axis.ticks           = element_line(color = "black"),
-    
     # inside top-right
     legend.position      = c(0.997, 0.998),
     legend.justification = c(1, 1),
@@ -247,31 +401,27 @@ permutation_plot <- ggplot(perm_df, aes(x = perm_diff)) +
     legend.text          = element_text(size = 18),
     legend.spacing.y = unit(0,"cm"),
   ) 
-
  ggsave(
-   filename = "C:/Users/cwako/OneDrive - University of Sussex/PhD/Projects/Old complete datasets/Results/permutation_plot_new.svg",
+   filename = file.path(results_path, "permutation_plot_new.svg"),
    plot     = permutation_plot,
    width    = 200,       # cm (1/3 of 84.1 cm)
    height   = 150,     # cm (aspect ratio 10:6)
    units    = "mm",
    dpi      = 300
  )
-#'
-#' ## Baseline models (101 participants)
-#' 
-## ----------------------------------------------------------------------------------------------------------------
+
+
+## ---------------------------------------------------------------------------------------------------------------------
 ## Negative Intrusive thought modeled from depression levels
 dep_c1_lm <- lmerTest::lmer(Component_1_z ~ CESD_stnd + AGE + GENDER + (1|ID), data = esm_traits_base)
-
 anova_c1<- car::Anova(dep_c1_lm, type = 3, test.statistic = "F") |> 
   as.data.frame()
-anova_tbl <- anova_c1 %>%
+anova_tbl <- anova_c1 |>
   rownames_to_column(var = "term")
-
 anova_c1
 
-#' 
-## ----------------------------------------------------------------------------------------------------------------
+
+## ---------------------------------------------------------------------------------------------------------------------
 # Plot the relationship
 depression_model_plot <- ggplot(
   esm_traits_base,
@@ -287,14 +437,12 @@ depression_model_plot <- ggplot(
     seed = 123
   )
   ) +
-
   geom_smooth(
     aes(color = "Best fit", fill = "95% CI"),
     method = "lm",
     size = 1,
     se = TRUE
   ) +
-
   # ---- SIDE DENSITIES (SAFE) ----
   geom_xsidedensity(
     aes(y = after_stat(density)),
@@ -306,7 +454,6 @@ depression_model_plot <- ggplot(
     fill = "grey70",
     alpha = 0.4
   ) +
-
   scale_color_manual(
     name = NULL,
     values = c(
@@ -319,12 +466,10 @@ depression_model_plot <- ggplot(
     values = c("95% CI" = "#e06666"),
     guide = guide_legend(override.aes = list(color = NA))
   ) +
-
   labs(
     x = "Depression score (CESD)",
     y = "Negative Intrusive Thought (Component 1)"
   ) +
-
   theme_minimal(base_size = 20) +
   theme(
     ggside.panel.scale = 0.25,
@@ -335,13 +480,12 @@ depression_model_plot <- ggplot(
     legend.position = c(0.997, 0.998),
     legend.justification = c(1, 1)
   )
-
 depression_model_plot
 
-#' 
-## ----------------------------------------------------------------------------------------------------------------
+
+## ---------------------------------------------------------------------------------------------------------------------
 ggsave(
-  filename = file.path("results", "depression_c1_scatter.svg"),
+  filename = file.path(results_path, "depression_c1_scatter.svg"),
   plot     = depression_model_plot,
   width    = 280,       
   height   = 150,     
@@ -349,15 +493,13 @@ ggsave(
   dpi      = 300
 )
 
-#' 
-#' ## Frequency Models
-#' 
-## ----------------------------------------------------------------------------------------------------------------
+
+## ---------------------------------------------------------------------------------------------------------------------
 # Calculate the median of Negative Intrusive thought
 median_c1 <- median(esm_traits_base$Component_1_z)
 
-#' 
-## ----------------------------------------------------------------------------------------------------------------
+
+## ---------------------------------------------------------------------------------------------------------------------
 # Median split, to be able to count frequency of high and low negative intrusive thought experienced
 esm_traits_base <- esm_traits_base |>
   mutate(C1_prop = case_when(
@@ -365,42 +507,39 @@ esm_traits_base <- esm_traits_base |>
     TRUE ~ "Low"
   ))
 
-#' 
-## ----------------------------------------------------------------------------------------------------------------
+
+## ---------------------------------------------------------------------------------------------------------------------
 # Categorise depression into Yes or No based on questionnaire threshold
-esm_traits_base <- esm_traits_base %>%
+esm_traits_base <- esm_traits_base |>
   mutate(CESD_th = ifelse(CESD >= 16, "Yes", "No"))
 
-#' 
-## ----------------------------------------------------------------------------------------------------------------
+
+## ---------------------------------------------------------------------------------------------------------------------
 # Calculate proportion of High and Low Negative Intrusive Thought
-participant_counts <- esm_traits_base %>%
-  group_by(ID, C1_prop, CESD_th) %>%
-  summarise(n = n(), .groups = "drop") %>%
+participant_counts <- esm_traits_base |>
+  group_by(ID, C1_prop, CESD_th) |>
+  summarise(n = n(), .groups = "drop") |>
   complete(ID, C1_prop, fill = list(n = 0)) |>
   group_by(ID) |>
   tidyr::fill(CESD_th, .direction = "downup") |>
-  mutate(prop = n / sum(n)) %>%
+  mutate(prop = n / sum(n)) |>
   ungroup() 
 
-#' 
-#' ### Model
-#' ### Binomial reg
-#' 
-## ----------------------------------------------------------------------------------------------------------------
-esm_binomial <- esm_traits_base %>%
-  group_by(ID) %>%
+
+## ---------------------------------------------------------------------------------------------------------------------
+esm_binomial <- esm_traits_base |>
+  group_by(ID) |>
   summarise(
     high = sum(C1_prop == "High", na.rm = TRUE),
     total = n(),
     CESD_stnd = first(CESD_stnd),
     AGE = first(AGE),
     GENDER = first(GENDER)
-  ) %>%
+  ) |>
   mutate(low = total - high)
 
-#' 
-## ----------------------------------------------------------------------------------------------------------------
+
+## ---------------------------------------------------------------------------------------------------------------------
 model_binom <- glm(cbind(high, total - high) ~ CESD_stnd + AGE + GENDER,
                    family = binomial(link = "logit"),
                    data = esm_binomial)
@@ -408,8 +547,8 @@ summary(model_binom)
 or_bi <- parameters::parameters(model_binom, exponentiate = TRUE, p_adjust = "fdr") 
 or_bi |> knitr::kable(digits = 3)
 
-#' 
-## ----------------------------------------------------------------------------------------------------------------
+
+## ---------------------------------------------------------------------------------------------------------------------
 binomial_plot <-ggplot(esm_binomial, aes(x = CESD_stnd, y = high / total)) +
   geom_point(color = "black", alpha = 0.6, size = 1.5) +
   stat_smooth(method = "glm", 
@@ -421,13 +560,12 @@ binomial_plot <-ggplot(esm_binomial, aes(x = CESD_stnd, y = high / total)) +
     x = "Depression Score (CESD)"
   ) +
   theme_minimal(base_size = 18) 
-
 binomial_plot
 
-#' 
-## ----------------------------------------------------------------------------------------------------------------
+
+## ---------------------------------------------------------------------------------------------------------------------
 ggsave(
-  filename = file.path("results", "binomial_plot_c1.jpg"),
+  filename = file.path(results_path, "binomial_plot_c1.jpg"),
   plot     = binomial_plot,
   width    = 240,       # cm (1/3 of 84.1 cm)
   height   = 150,     # cm (aspect ratio 10:6)
@@ -435,60 +573,33 @@ ggsave(
   dpi      = 300
 )
 
-#' 
-#' HMMs
-## ----------------------------------------------------------------------------------------------------------------
+
+## ---------------------------------------------------------------------------------------------------------------------
 esm_hmm <- esm_centroids |>
   filter(Stimulus_Type == "Baseline") |>
-  arrange(ID, Date) %>%
+  arrange(ID, Date) |>
   dplyr::select(ID, Date, Component_1_z:Component_5_z) 
 
-# ----------------------------------------
-# FUNCTION TO FIT MODEL FOR GIVEN K & SEED
-# ----------------------------------------
-fit_hmm <- function(K, seed, data) {
-  set.seed(seed)
-  
-  mod <- depmix(
-    response = list(
-      Component_1_z ~ 1,
-      Component_2_z ~ 1,
-      Component_3_z ~ 1,
-      Component_4_z ~ 1,
-      Component_5_z ~ 1
-    ),
-    data = data,
-    nstates = K,
-    family = rep(list(gaussian()), 5),
-    ntimes = as.numeric(table(data$ID))
-  )
-  
-  fitted <- try(fit(mod, verbose = FALSE), silent = TRUE)
-  
-  if (inherits(fitted, "try-error")) return(NA)
-  
-  return(fitted)
-}
 
-# ------------------------------
-# SETTINGS
-# ------------------------------
+## ---------------------------------------------------------------------------------------------------------------------
+# Fit HMMs across K values and random seeds 
 K_values <- 2:5
 seeds    <- 1:20
 
-# ------------------------------
-# RUN ALL MODELS
-# ------------------------------
-results <- expand.grid(K = K_values, seed = seeds) %>%
+results <- expand.grid(K = K_values, seed = seeds) |>
   mutate(
-    model = map2(K, seed, ~ fit_hmm(.x, .y, esm_hmm)),
-    
+    # fit_hmm(data, K, seed) returns a fitted model or NULL if fitting fails
+    model = map2(K, seed, ~ fit_hmm(data = esm_hmm, K = .x, seed = .y)),
+    # Extract log-likelihood (NA if model failed)
     logLik = map_dbl(model, function(m) {
-      if (inherits(m, "try-error") || is.null(m)) return(NA_real_)
-      as.numeric(logLik(m))
-    })
-  )
+      if (is.null(m)) return (NA_real_)
+      as.numeric(logLik(m))}
+      ))
 
+
+
+## ---------------------------------------------------------------------------------------------------------------------
+# Plot log-likelihood as a function of K
 k_log_plot <- ggplot(results, aes(x = K, y = logLik)) +
   stat_summary(fun = mean, geom = "line", linewidth = 1) +
   stat_summary(fun.data = mean_cl_normal, geom = "errorbar", width = 0.1) +
@@ -498,75 +609,33 @@ k_log_plot <- ggplot(results, aes(x = K, y = logLik)) +
     x = "Number of states",
     y = "Log-likelihood"
   )
-
 ggsave(
-  filename = file.path("results", "k_log_plot.png"),
+  filename = file.path(results_path, "k_log_plot.png"),
   plot     = k_log_plot,
   units    = "mm",
-  width = 700,
-  height = 320,
+  width    = 220,
+  height   = 110,
   dpi   = 300
 )
 
-extract_state_means <- function(model) {
-  # Each state has 5 response models (one per component)
-  sapply(model@response, function(state_list) {
-    sapply(state_list, function(r) r@parameters$coefficients)
-  })
-}
 
-state_similarity <- function(mat1, mat2) {
-  cor(mat1, mat2)  # returns K × K matrix
-}
-
-match_states <- function(sim_mat) {
-  sim_mat[is.na(sim_mat)] <- 0             # replace NAs
-  
-  # convert to non-negative cost matrix
-  cost_mat <- 1 - sim_mat                  # cost ∈ [0, 2]
-  
-  solve_LSAP(cost_mat)                     # Hungarian algorithm
-}
-
-# Extract state maps
+## ---------------------------------------------------------------------------------------------------------------------
+# Extract per-state mean maps
+# These are used to assess whether state solutions are consistent across random seeds.
 results <- results |>
   mutate(
-    state_means = map(model, ~ {
-      if (!inherits(.x, "try-error")) {
-        extract_state_means(.x)
-      } else {
-        NA
-      }
-    })
+    state_means = map(model, extract_state_means))
+
+## ---------------------------------------------------------------------------------------------------------------------
+# Compute cross-seed stability for each K
+# Stability is the average matched correlation between state-mean maps across all seed pairs.
+
+stability_scores <- results |>
+  dplyr::group_by(K) |>
+  dplyr::summarise(
+    stability = compute_stability_for_K(dplyr::pick(everything())),
+    .groups = "drop"
   )
-
-compute_stability_for_K <- function(dfK) {
-  
-  mats <- dfK$state_means
-  n <- length(mats)
-  sims <- c()
-  
-  for (i in 1:(n-1)) {
-    for (j in (i+1):n) {
-      if (is.matrix(mats[[i]]) && is.matrix(mats[[j]])) {
-        
-        S <- cor(mats[[i]], mats[[j]])
-        S[is.na(S)] <- 0
-        
-        assignment <- match_states(S)
-        matched <- S[cbind(1:ncol(S), assignment)]
-        
-        sims <- c(sims, mean(matched))
-      }
-    }
-  }
-  
-  mean(sims)
-}
-
-stability_scores <- results %>%
-  group_by(K) %>%
-  dplyr::summarise(stability = compute_stability_for_K(cur_data()))
 
 state_stability_plot <- ggplot(stability_scores, aes(K, stability)) +
   geom_point(size = 4) +
@@ -578,84 +647,84 @@ state_stability_plot <- ggplot(stability_scores, aes(K, stability)) +
   )
 
 ggsave(
-  filename = file.path("results", "state_stability.png"),
+  filename = file.path(results_path, "state_stability.png"),
   plot     = state_stability_plot,
   units    = "mm",
-  width = 700,
-  height = 320,
+  width    = 220,
+  height   = 110,
   dpi   = 300
 )
 
-# Now we keep only one model K =3
-nstates = 3
-build_model <- function(startseed) {
-  set.seed(startseed)
-  mod <- depmix(response = list(
-    Component_1_z ~ 1,
-    Component_2_z ~ 1,
-    Component_3_z ~ 1,
-    Component_4_z ~ 1,
-    Component_5_z ~ 1),
-    data = esm_hmm,
-    nstates = nstates,
-    family = rep(list(gaussian()), 5),
-    ntimes = as.numeric(table(esm_hmm$ID)))
-  fit(mod, verbose = FALSE)
+
+## ---------------------------------------------------------------------------------------------------------------------
+# Now we keep only one model, here K =3
+final_K <- 3
+
+best_row <- results |>
+  dplyr::filter(K == final_K) |>
+  dplyr::arrange(dplyr::desc(logLik)) |>
+  dplyr::slice(1)
+
+fitted_mod <- best_row$model[[1]]
+best_model_seed <- best_row$seed[[1]]
+
+if (is.null(fitted_mod)) {
+  stop("All model fits failed for final_K = ", final_K, ". Try more seeds or check the data.")
 }
 
-# Try multiple seeds
-seeds <- 1:20 # K=2: 12, K=3: 19, K= 4: 11,  K=5: 16
-models <- lapply(seeds, build_model)
+# Report fit statistics for the selected model
+AIC(fitted_mod)
+BIC(fitted_mod)
+logLik(fitted_mod)
+best_model_seed
 
-# Compare log-likelihoods
-log_liks <- sapply(models, logLik)
 
-# Pick the best model
-best_index <- which.max(log_liks)
-
-# Extract the best model and its seed
-best_model <- models[[best_index]]
-best_model_seed <- seeds[best_index]
-
-AIC(best_model)
-BIC(best_model)
-logLik(best_model)
-
-fitted_mod <- best_model
-
+## ---------------------------------------------------------------------------------------------------------------------
 # Decode the viterbi path from the state probabilities
 esm_hmm$State <- posterior(fitted_mod, type = 'viterbi')$state
-
 model_summary <- suppressMessages(capture.output(summary_obj <- summary(fitted_mod)))
 state_table <- as.data.frame(summary_obj)
 
+## ---------------------------------------------------------------------------------------------------------------------
+# Extract state mean maps for plotting
 # Keep only columns with intercepts (means), e.g., "Re1.(Intercept)", "Re2.(Intercept)", etc.
 mean_cols <- grep("\\.\\(Intercept\\)", names(state_table), value = TRUE)
 
+
+## ---------------------------------------------------------------------------------------------------------------------
 # Subset just the mean columns
 state_means <- state_table[, mean_cols]
 
+
+## ---------------------------------------------------------------------------------------------------------------------
 # Rename columns to Component_1, Component_2, etc.
 colnames(state_means) <- paste0("Component_", seq_along(mean_cols))
 
+
+## ---------------------------------------------------------------------------------------------------------------------
 # Add State identifier
 state_means <- state_means |>
   mutate(State = paste0("State_", row_number())) |>
   relocate(State)
 
+
+## ---------------------------------------------------------------------------------------------------------------------
 # Demean weights within each state (row-wise centering)
-state_means_demeaned <- state_means %>%
-  rowwise() %>%
+state_means_demeaned <- state_means |>
+  rowwise() |>
   mutate(across(starts_with("Component"),
-                ~ .x - mean(c_across(starts_with("Component"))))) %>%
+                ~ .x - mean(c_across(starts_with("Component"))))) |>
   ungroup()
 
-state_means_raw <- state_means %>%
+# Raw state weights, long format
+state_means_raw <- state_means |>
   pivot_longer(cols = starts_with("Component"),
                names_to = "Component",
                values_to = "Weight") |>
   mutate(State = fct_relevel(State, "State_3", "State_2", "State_1"))
 
+
+## ---------------------------------------------------------------------------------------------------------------------
 # Plot of state means without demeaning
 state_composition <- ggplot(state_means_raw, aes(x = Component, y = State, fill = Weight)) +
   geom_tile(color = "white") +
@@ -679,7 +748,7 @@ state_composition <- ggplot(state_means_raw, aes(x = Component, y = State, fill 
   )
 
 ggsave(
-  filename = file.path("results", "state_composition.svg"),
+  filename = file.path(results_path, "state_composition.svg"),
   plot     = state_composition,   
   units    = "mm",
   width = 700,
@@ -687,15 +756,11 @@ ggsave(
   dpi   = 300
 )
 
-# Function to compute switching rate in a vector of states
-switching_rate <- function(states) {
-  if (length(states) < 2) return(NA_real_)
-  mean(diff(states) != 0)  # proportion of times state changes
-}
 
-# Per participant
-switching_df <- esm_hmm %>%
-  group_by(ID) %>%
+## ---------------------------------------------------------------------------------------------------------------------
+# Compute switching rate for each state per participant
+switching_df <- esm_hmm |>
+  group_by(ID) |>
   summarise(switch_rate = switching_rate(State), .groups = "drop") |>
   left_join(cesd_by_id, by = "ID") |>
   mutate(
@@ -703,175 +768,84 @@ switching_df <- esm_hmm %>%
     GENDER = forcats::as_factor(GENDER),
   )
 
-switching_counts <- esm_hmm %>%        
-  group_by(ID) %>%
+# Counts-based switching variables:
+#   total_transitions = N-1
+#   n_switches       = number of times State[t] != State[t-1]
+switching_counts <- esm_hmm |>        
+  group_by(ID) |>
   dplyr::summarise(
-    total_transitions = n() - 1,    # number of transitions = observations − 1
-    n_switches = sum(diff(State) != 0),  # number of times state changes
-    switch_rate = n_switches / total_transitions,  # optional check
-  ) %>%
-  ungroup() |> 
+    total_transitions = n() - 1,    
+    n_switches = sum(diff(State) != 0),  
+    switch_rate       = ifelse(total_transitions > 0,
+                              n_switches / total_transitions,
+                              NA_real_),
+    .groups = "drop"
+  ) |> 
   left_join(cesd_by_id, by = "ID") |>
   mutate(
     AGE_stnd = scale(AGE),             
     GENDER = forcats::as_factor(GENDER),
   )
-# Fit model of switching rates from depression age and gender
+
+
+## ---------------------------------------------------------------------------------------------------------------------
+# Fit model of switching as binomial from depression age and gender
 switch_binomial <- glm(
   cbind(n_switches, total_transitions - n_switches) ~ CESD_stnd + AGE_stnd + GENDER,
   data = switching_counts,
-  family = binomial
+  family = binomial()
 )
 
 summary(switch_binomial)
 sw_bi <- parameters::parameters(switch_binomial, exponentiate = TRUE, p_adjust = "fdr") 
 sw_bi |> knitr::kable(digits = 3)
 
-# Transition probabilities
-# WITH SELF TRANSITIONS
 
-compute_tpm <- function(states, n_states) {
-  # Create transition count matrix
-  tpm_counts <- matrix(0, nrow = n_states, ncol = n_states)
-  rownames(tpm_counts) <- paste0("S", 1:n_states)
-  colnames(tpm_counts) <- paste0("S", 1:n_states)
-  
-  for (i in 1:(length(states) - 1)) {
-    from <- states[i]
-    to <- states[i + 1]
-    if (!is.na(from) && !is.na(to)) {
-      tpm_counts[from, to] <- tpm_counts[from, to] + 1
-    }
-  }
-  
-  # Convert to probabilities (row-wise)
-  row_sums <- rowSums(tpm_counts)
-  tpm_probs <- sweep(tpm_counts, 1, row_sums, FUN = "/")
-  tpm_probs[is.na(tpm_probs)] <- 0
-  
-  return(tpm_probs)
-}
-
+## ---------------------------------------------------------------------------------------------------------------------
 n_states <- length(unique(esm_hmm$State))
 
-# Compute TPMs per participant
-participant_tpms <- esm_hmm %>%
-  group_by(ID) %>%
-  group_split() %>%
+
+## ---------------------------------------------------------------------------------------------------------------------
+# Compute TPMs per participant (with self transitions)
+participant_tpms <- esm_hmm |>
+  group_by(ID) |>
+  group_split() |>
   map(~ compute_tpm(.x$State, n_states))
 
+## ---------------------------------------------------------------------------------------------------------------------
 # Name each matrix by participant ID
 names(participant_tpms) <- unique(esm_hmm$ID)
 
-tpm_long_df <- map2_dfr(participant_tpms, names(participant_tpms), function(mat, id) {
-  as_tibble(mat, .name_repair = "minimal") %>%
-    mutate(from = rownames(mat), ID = id) %>%
-    pivot_longer(cols = starts_with("S"), names_to = "to", values_to = "prob")
-})
-
-tpm_with_cesd <- tpm_long_df %>%
-  left_join(cesd_by_id, by = "ID") |>
-  mutate(
-    AGE_stnd = scale(AGE),             # Standardised (z-scored)
-    GENDER = forcats::as_factor(GENDER),
-  )
-
-tpm_sym <- tpm_with_cesd %>%  
-  mutate(
-    pair = ifelse(from < to,
-                  paste0(from, "_", to),
-                  paste0(to, "_", from))
-  )
-
-tpm_pair_avg <- tpm_sym %>%
-  group_by(ID, pair) %>%
-  summarise(
-    prob_avg = mean(prob, na.rm = TRUE),
-    CESD_stnd = first(CESD_stnd),
-    AGE_stnd  = first(AGE_stnd),
-    GENDER    = first(GENDER),
-    .groups = "drop"
-  )
-
-# fit a model for each from to transition pair, correct for multiple comparisons
-transition_sym_stats <- tpm_pair_avg %>%
-  group_by(pair) %>%
-  nest() %>%
-  mutate(
-    model = map(data, ~ lm(prob_avg ~ CESD_stnd + AGE_stnd + GENDER, data = .x)),
-    tidy  = map(model, ~ broom::tidy(.x, conf.int = TRUE))
-  ) %>%
-  unnest(tidy) %>%
-  group_by(term) |>
-  mutate(p_fdr = p.adjust(p.value, method = "fdr")) |>
-  ungroup() %>%
-  mutate(across(where(is.numeric), ~ round(.x, 3)))
-
-## WITHOUT SELF TRANSITIONS
-compute_tpm_secondary <- function(states, n_states) {
-  # Transition count matrix
-  tpm_counts <- matrix(0, nrow = n_states, ncol = n_states)
-  rownames(tpm_counts) <- paste0("S", 1:n_states)
-  colnames(tpm_counts) <- paste0("S", 1:n_states)
-  
-  for (i in 1:(length(states)-1)) {
-    from <- states[i]
-    to <- states[i + 1]
-    if (!is.na(from) && !is.na(to)) {
-      tpm_counts[from, to] <- tpm_counts[from, to] + 1
+tpm_long_df <- map2_dfr(
+  participant_tpms, 
+  names(participant_tpms), 
+  function(mat, id) {
+  as_tibble(mat, .name_repair = "minimal") |>
+    mutate(from = rownames(mat), ID = id) |>
+    pivot_longer(
+      cols = starts_with("S"), 
+      names_to = "to", 
+      values_to = "prob"
+      )
     }
-  }
-  
-  # Remove self-transitions (set diagonals to 0)
-  diag(tpm_counts) <- 0
-  
-  # Convert to probabilities row-wise (renormalised on off-diagonal counts only)
-  row_sums <- rowSums(tpm_counts)
-  tpm_probs <- sweep(tpm_counts, 1, row_sums, FUN = "/")
-  tpm_probs[is.na(tpm_probs)] <- 0
-  
-  return(tpm_probs)
-}
+  )
 
-n_states <- length(unique(esm_hmm$State))
-
-# Compute secondary TPM per participant
-participant_tpms_secondary <- esm_hmm %>%
-  group_by(ID) %>%
-  group_split() %>%
-  map(~ compute_tpm_secondary(.x$State, n_states))
-
-# Name each matrix by participant ID
-names(participant_tpms_secondary) <- unique(esm_hmm$ID)
-
-# Convert to long df for analysis
-tpm_secondary_long <- map2_dfr(participant_tpms_secondary,
-                               names(participant_tpms_secondary),
-                               function(mat, id) {
-                                 as_tibble(mat, .name_repair = "minimal") %>%
-                                   mutate(from = rownames(mat), ID = id) %>%
-                                   pivot_longer(cols = starts_with("S"),
-                                                names_to = "to",
-                                                values_to = "prob")
-                               })
-# Add CESD scores
-tpm_secondary_long <- tpm_secondary_long %>%
+# Join TMP to depression and demographic data
+tpm_with_cesd <- tpm_long_df |>
   left_join(cesd_by_id, by = "ID") |>
   mutate(
-    AGE_stnd = scale(AGE),             # Standardised (z-scored)
+    AGE_stnd = scale(AGE),        
     GENDER = forcats::as_factor(GENDER),
   )
 
-tpm_sym_sec <- tpm_secondary_long %>%
-  filter(from != to) %>%    
+# Collapse (from,to) and (to,from) into one undirected pair label
+tpm_pair_avg <- tpm_with_cesd |>  
   mutate(
     pair = ifelse(from < to,
                   paste0(from, "_", to),
                   paste0(to, "_", from))
-  )
-
-tpm_pair_sec <- tpm_sym_sec %>%
-  group_by(ID, pair) %>%
+  ) |>
+  group_by(ID, pair) |>
   summarise(
     prob_avg = mean(prob, na.rm = TRUE),
     CESD_stnd = first(CESD_stnd),
@@ -880,69 +854,145 @@ tpm_pair_sec <- tpm_sym_sec %>%
     .groups = "drop"
   )
 
-# fit a model for each transition pair, correct for multiple comparisons
-transition_sym_stats_sec <- tpm_pair_sec %>%
-  group_by(pair) %>%
-  nest() %>%
+
+## ---------------------------------------------------------------------------------------------------------------------
+# Fit a model for each from to transition pair, correct for multiple comparisons
+transition_sym_stats <- tpm_pair_avg |>
+  group_by(pair) |>
+  nest() |>
   mutate(
     model = map(data, ~ lm(prob_avg ~ CESD_stnd + AGE_stnd + GENDER, data = .x)),
-    tidy  = map(model, ~ broom::tidy(.x, conf.int = TRUE))
-  ) %>%
-  unnest(tidy) %>%
+    tidy  = map(model, ~ tidy(.x, conf.int = TRUE))
+  ) |>
+  unnest(tidy) |>
   group_by(term) |>
   mutate(p_fdr = p.adjust(p.value, method = "fdr")) |>
-  ungroup() %>%
+  ungroup() |>
   mutate(across(where(is.numeric), ~ round(.x, 3)))
 
-# Compute fractional occupancy per participant × state
-fractional_occupancy <- esm_hmm %>%
-  group_by(ID, State) %>%
-  summarise(n_timepoints = n(), .groups = "drop") %>%
-  group_by(ID) %>%
-  mutate(FO = n_timepoints / sum(n_timepoints)) %>%
-  ungroup() %>%
-  complete(ID, State, fill = list(FO = 0, n_timepoints = 0)) %>%
+
+## ---------------------------------------------------------------------------------------------------------------------
+# Compute secondary TPM per participant (without self-transitions)
+participant_tpms_no_self <- esm_hmm |>
+  group_by(ID) |>
+  group_split() |>
+  map(~ compute_tpm_no_self(.x$State, n_states))
+
+
+## ---------------------------------------------------------------------------------------------------------------------
+# Name each matrix by participant ID
+names(participant_tpms_no_self) <- unique(esm_hmm$ID)
+
+
+## ---------------------------------------------------------------------------------------------------------------------
+# Convert to long df for analysis
+tpm_no_self_long <- map2_dfr(
+  participant_tpms_no_self,
+  names(participant_tpms_no_self),
+  function(mat, id) {
+    as_tibble(mat, .name_repair = "minimal") |>
+      mutate(from = rownames(mat), ID = id) |>
+      pivot_longer(cols = starts_with("S"),
+                   names_to = "to",
+                   values_to = "prob")
+    }) |>
   left_join(cesd_by_id, by = "ID") |>
   mutate(
-    AGE_stnd = scale(AGE),             # Standardised (z-scored)
+    AGE_stnd = scale(AGE),             
     GENDER = forcats::as_factor(GENDER),
   )
 
-# fit a model for each state, correct for multiple comparisons
-fo_beta_results <- fractional_occupancy %>%
-  group_by(State) %>%
-  nest() %>%
+
+## ---------------------------------------------------------------------------------------------------------------------
+# Compute symmetrical matrix of transitions
+tpm_pair_no_self <- tpm_no_self_long |>
+  filter(from != to) |>    
+  mutate(
+    pair = ifelse(from < to,
+                  paste0(from, "_", to),
+                  paste0(to, "_", from))
+  ) |>
+  group_by(ID, pair) |>
+  summarise(
+    prob_avg = mean(prob, na.rm = TRUE),
+    CESD_stnd = first(CESD_stnd),
+    AGE_stnd  = first(AGE_stnd),
+    GENDER    = first(GENDER),
+    .groups = "drop"
+  )
+
+
+## ---------------------------------------------------------------------------------------------------------------------
+# Fit a model for each transition pair, correct for multiple comparisons
+transition_sym_stats_no_self <- tpm_pair_no_self |>
+  group_by(pair) |>
+  nest() |>
+  mutate(
+    model = map(data, ~ lm(prob_avg ~ CESD_stnd + AGE_stnd + GENDER, data = .x)),
+    tidy  = map(model, ~ tidy(.x, conf.int = TRUE))
+  ) |>
+  unnest(tidy) |>
+  group_by(term) |>
+  mutate(p_fdr = p.adjust(p.value, method = "fdr")) |>
+  ungroup() |>
+  mutate(across(where(is.numeric), ~ round(.x, 3)))
+
+
+## ---------------------------------------------------------------------------------------------------------------------
+# Compute fractional occupancy per participant × state
+fractional_occupancy <- esm_hmm |>
+  group_by(ID, State) |>
+  summarise(n_timepoints = n(), .groups = "drop") |>
+  group_by(ID) |>
+  mutate(FO = n_timepoints / sum(n_timepoints)) |>
+  ungroup() |>
+  complete(ID, State, fill = list(FO = 0, n_timepoints = 0)) |>
+  left_join(cesd_by_id, by = "ID") |>
+  mutate(
+    AGE_stnd = scale(AGE),            
+    GENDER = forcats::as_factor(GENDER)
+  )
+
+
+## ---------------------------------------------------------------------------------------------------------------------
+# Fit a model for each state, correct for multiple comparisons
+fo_beta_results <- fractional_occupancy |>
+  group_by(State) |>
+  nest() |>
   mutate(
     model = map(data, ~ glmmTMB(FO ~ CESD_stnd ,
                                 data = .x,
                                 family = ordbeta(link = "logit"))),
-    tidy = map(model, ~ broom.mixed::tidy(.x, conf.int = TRUE))
-  ) %>%
-  unnest(tidy) %>%# keep only numeric rounding after the correction
-  mutate(term = as.character(term)) %>%
-  # --- NEW: apply FDR correction across all CESD effects ---
-  group_by(term) %>%
-  mutate(p_adj_fdr = p.adjust(p.value, method = "fdr")) %>%
+    tidy = map(model, ~ tidy(.x, conf.int = TRUE))
+  ) |>
+  unnest(tidy) |>
+  mutate(term = as.character(term)) |>
+  group_by(term) |>
+  mutate(p_adj_fdr = p.adjust(p.value, method = "fdr")) |>
+  ungroup() |>
   mutate(across(where(is.numeric), ~ round(.x, 4)))
 
+
+## ---------------------------------------------------------------------------------------------------------------------
 ## Cluster analysis of the centroid coordinates of participants
 centroid_dep <- centroid_summary |>
   left_join(esm_traits_z |> dplyr::select(ID, AGE, GENDER, CESD, CESD_stnd) |> distinct(), by = "ID")
 
 sil_results <- data.frame(k = 2:8, avg_sil = NA)
-
 for (k in 2:8) {
   pam_fit <- pam(centroid_dep[, c("Geom_1","Geom_2","Geom_3","Geom_4","Geom_5")],
                  k = k, metric = "euclidean")
-  
   sil_obj <- silhouette(pam_fit)
   sil_results$avg_sil[sil_results$k == k] <- mean(sil_obj[, "sil_width"])
 }
 
 sil_results
+
 plot(sil_results$k, sil_results$avg_sil, type = "b",
      xlab = "k", ylab = "Average silhouette width")
 
+
+## ---------------------------------------------------------------------------------------------------------------------
 # Plot the silhouette width to identify best K cluster
 sil_plot <- ggplot(sil_results, aes(x = k, y = avg_sil)) +
   geom_line(linewidth = 0.6, linetype = 1) +   # line first, underneath
@@ -950,19 +1000,20 @@ sil_plot <- ggplot(sil_results, aes(x = k, y = avg_sil)) +
   labs(x = "k", y = "Average silhouette width") +
   theme_minimal(base_size = 18)
 
-ggsave(filename = file.path("results", "silhouette_plot.png"),
+ggsave(filename = file.path(results_path, "silhouette_plot.png"),
   plot     = sil_plot,
   width    = 200,       # cm (1/3 of 84.1 cm)
   height   = 150,     # cm (aspect ratio 10:6)
   units    = "mm",
   dpi      = 300)
 
+
+## ---------------------------------------------------------------------------------------------------------------------
 # Fit the clustering on selected K
 set.seed(123)
+
 esm_kmed_cent <- pam(centroid_dep[, c("Geom_1", "Geom_2", "Geom_3", "Geom_4", "Geom_5")], k = 4, metric = "euclidean", stand = FALSE)
-
 centroid_dep$cluster_med <- esm_kmed_cent$cluster
-
 centroid_dep <- centroid_dep |>
   ungroup() |>
   dplyr::mutate(cluster_med = forcats::as_factor(cluster_med),
@@ -971,15 +1022,17 @@ centroid_dep <- centroid_dep |>
                 GENDER = forcats::as_factor(GENDER)
   ) 
 
+
+## ---------------------------------------------------------------------------------------------------------------------
 # Fit a model to test if the cluster membership based on the centroid coordinates predicts levels of depression
 cluster_centroid <- lm(CESD_stnd ~ cluster_med + AGE_stnd + GENDER, data = centroid_dep)
-
 summary(cluster_centroid)
 
 modelbased::estimate_contrasts(cluster_centroid, contrast = "cluster_med",adjust = "fdr",fixed = c("AGE_stnd", "GENDER")) |> knitr::kable(digits = 3)
 
-# Cluster plot TODO
 
+## ---------------------------------------------------------------------------------------------------------------------
+# Cluster plot 
 # ---- Component label lookup ----
 component_labels <- tibble(
   Component = c("Geom_1", "Geom_2", "Geom_3", "Geom_4", "Geom_5"),
@@ -992,88 +1045,91 @@ component_labels <- tibble(
   )
 )
 
-# --- Helper function to get pretty label ---
-get_label <- function(comp_name) {
-  component_labels$Label[component_labels$Component == comp_name]
-}
 
+## ---------------------------------------------------------------------------------------------------------------------
 # --- All Geom columns ---
 geom_vars <- component_labels$Component
 
+
+## ---------------------------------------------------------------------------------------------------------------------
 # --- All unique pairs (Geom_i, Geom_j) where i < j ---
 pairs <- combn(geom_vars, 2, simplify = FALSE)
+
+
+## ---------------------------------------------------------------------------------------------------------------------
 # Compute convex hull per cluster (the outline of the cloud)
 # convex hull algorithm
+## TODO: FIX 
 
-# ---- Loop over each pair ----
-for (pair in pairs) {
-  
-  x_var <- pair[1]
-  y_var <- pair[2]
-  
-  x_lab <- get_label(x_var)
-  y_lab <- get_label(y_var)
-  cluster_hulls <- centroid_dep %>%
-    filter(cluster_med %in% c(1,2)) %>%
-    group_by(cluster_med) %>%
-    do({
-      # extract numeric matrix (NO tibble!)
-      pts <- as.matrix(select(., Geom_1, Geom_2, Geom_3, Geom_4, Geom_5))
-      
-      # concaveman requires a matrix of xy coordinates
-      hull <- concaveman(pts)
-      
-      # concaveman returns a matrix → convert to df & add cluster label
-      hull_df <- as.data.frame(hull)
-      names(hull_df) <- c("Geom_1", "Geom_2", "Geom_3", "Geom_4", "Geom_5")
-      hull_df$cluster_med <- unique(.$cluster_med)
-      hull_df
-    }) %>%
-    ungroup()
-  
-  # Build plot
-  p <- ggplot() +
-    geom_polygon(
-      data = cluster_hulls,
-      aes(x = .data[[x_var]], y = .data[[y_var]], fill = cluster_med, group = cluster_med),
-      alpha = 0.08, colour = NA
-    ) +
-    geom_path(
-      data = cluster_hulls,
-      aes(x = .data[[x_var]], y = .data[[y_var]], colour = cluster_med, group = cluster_med),
-      linewidth = 1.1
-    ) +
-    scale_fill_brewer(palette = "Dark2", name = "Cluster", labels = c("Reference", "Cluster of interest")) +
-    scale_color_brewer(palette = "Dark2", guide = "none") +
-    ggnewscale::new_scale_color() +
-    geom_point(
-      data = centroid_dep %>% filter(cluster_med %in% c(1,2)),
-      aes(x = .data[[x_var]], y = .data[[y_var]], color = CESD_stnd),
-      size = 2, alpha = 0.8
-    ) +
-    scale_color_gradient(
-      low = "#0b6ac8", high = "#cc0000",
-      limits = c(-0.77872644, 0.4712813),
-      oob = scales::squish,
-      name = "Depression"
-    ) +
-    labs(x = x_lab, y = y_lab) +
-    theme_minimal(base_size = 16)
-  # #Save file
-  # filename <- paste0(/results/cluster_new", x_var, "_", y_var, ".svg")
-  # ggsave(filename, p, width = 7, height = 6, dpi = 300)
-  # 
-  # message("Saved: ", filename)
-  
-}
+# # ---- Loop over each pair ----
+# for (pair in pairs) {
+#   x_var <- pair[1]
+#   y_var <- pair[2]
+#   x_lab <- get_label(x_var)
+#   y_lab <- get_label(y_var)
+#   cluster_hulls <- centroid_dep |>
+#     filter(cluster_med %in% c(1,2)) |>
+#     group_by(cluster_med) |>
+#     do({
+#       # extract numeric matrix (NO tibble)
+#       pts <- as.matrix(select(., Geom_1, Geom_2, Geom_3, Geom_4, Geom_5))
+#       
+#       # concaveman requires a matrix of xy coordinates
+#       hull <- concaveman(pts)
+#       
+#       # concaveman returns a matrix → convert to df & add cluster label
+#       hull_df <- as.data.frame(hull)
+#       names(hull_df) <- c("Geom_1", "Geom_2", "Geom_3", "Geom_4", "Geom_5")
+#       hull_df$cluster_med <- unique(.$cluster_med)
+#       hull_df
+#     }) |>
+#     ungroup()
+#   
+#   # Build plot
+#   p <- ggplot() +
+#     geom_polygon(
+#       data = cluster_hulls,
+#       aes(x = .data[[x_var]], y = .data[[y_var]], fill = cluster_med, group = cluster_med),
+#       alpha = 0.08, colour = NA
+#     ) +
+#     geom_path(
+#       data = cluster_hulls,
+#       aes(x = .data[[x_var]], y = .data[[y_var]], colour = cluster_med, group = cluster_med),
+#       linewidth = 1.1
+#     ) +
+#     scale_fill_brewer(palette = "Dark2", name = "Cluster", labels = c("Reference", "Cluster of interest")) +
+#     scale_color_brewer(palette = "Dark2", guide = "none") +
+#     ggnewscale::new_scale_color() +
+#     geom_point(
+#       data = centroid_dep |> filter(cluster_med %in% c(1,2)),
+#       aes(x = .data[[x_var]], y = .data[[y_var]], color = CESD_stnd),
+#       size = 2, alpha = 0.8
+#     ) +
+#     scale_color_gradient(
+#       low = "#0b6ac8", high = "#cc0000",
+#       limits = c(-0.77872644, 0.4712813),
+#       oob = scales::squish,
+#       name = "Depression"
+#     ) +
+#     labs(x = x_lab, y = y_lab) +
+#     theme_minimal(base_size = 16)
+#   # #Save file
+#   # filename <- paste0(/results/cluster_new", x_var, "_", y_var, ".svg")
+#   # ggsave(filename, p, width = 7, height = 6, dpi = 300)
+#   # 
+#   # message("Saved: ", filename)
+# }
 
-## Distance analysis 
+
+## ---------------------------------------------------------------------------------------------------------------------
 esm_radius <- esm_centroids |>
   filter(Stimulus_Type != "Baseline") |>
   mutate(droplevels(Stimulus_Type))
 
 radius_mixed <- lmer(Radius_geom ~ Stimulus_Type + AGE_stnd + GENDER + (Stimulus_Type| ID), data = esm_centroids)
+
 summary(radius_mixed)
+
 parameters::parameters(radius_mixed, p_adjust = "fdr")
 
 esm_stim_cent <- esm_centroids |>
@@ -1083,6 +1139,8 @@ esm_stim_cent <- esm_centroids |>
                             "neg" = "Negative")
   )
 
+
+## ---------------------------------------------------------------------------------------------------------------------
 cols <- c("Positive" = "#cc0000", "Negative" = "#0c60ac", "Baseline" = "#444444")
 
 violin_distance <- ggplot(esm_stim_cent, aes(x = Condition, y = Radius_geom, fill = Condition)) +
@@ -1100,21 +1158,25 @@ violin_distance <- ggplot(esm_stim_cent, aes(x = Condition, y = Radius_geom, fil
   )
 
 ggsave(
-  filename = file.path("results", "violin_distance.svg"),
+  filename = file.path(results_path, "violin_distance.svg"),
   plot     = violin_distance,   
   units    = "mm",
   dpi      = 300
 )
 
+
+## ---------------------------------------------------------------------------------------------------------------------
 # Directional displacement analysis
 centroid_neg <- esm_centroids |>
   filter(Stimulus_Type == "neg") 
+
 centroid_pos <- esm_centroids |>
   filter(Stimulus_Type == "pos")
 
 centroid_pos <- centroid_pos |>
   group_by(ID) |>
   summarise(across(Component_1_z:Component_5_z, \(x) mean(x, na.rm = TRUE)), .groups = "drop")
+
 centroid_neg <- centroid_neg |>
   group_by(ID) |>
   summarise(across(Component_1_z:Component_5_z, \(x) mean(x, na.rm = TRUE)), .groups = "drop")
@@ -1122,23 +1184,31 @@ centroid_neg <- centroid_neg |>
 component_names <- paste0("Component_", 1:5, "_z")
 cent_names <- paste0("Geom_", 1:5)
 
+
+## ---------------------------------------------------------------------------------------------------------------------
 # Dot product of vectors a * b = ||a||*||b||cos0
 delta_neg <- centroid_neg[, component_names] - centroid_summary[, paste0(cent_names)]
 delta_pos <- centroid_pos[, component_names] - centroid_summary[, paste0(cent_names)]
-
 dot <- rowSums(delta_pos*delta_neg)
 
+
+## ---------------------------------------------------------------------------------------------------------------------
 # Vector norms
 norm_neg <- sqrt(rowSums(delta_neg^2))
 norm_pos <- sqrt(rowSums(delta_pos^2))
 
+
+## ---------------------------------------------------------------------------------------------------------------------
 # Cosine of angle (clip to avoid invalid arccos)
 cos_theta <- dot / (norm_neg * norm_pos)
 cos_theta <- pmin(pmax(cos_theta, -1), 1)  # Clamp to [-1, 1]
 
+## ---------------------------------------------------------------------------------------------------------------------
 # Angle in degrees
 angles_deg <- acos(cos_theta) * (180 / pi)
 
+
+## ---------------------------------------------------------------------------------------------------------------------
 # Combine into a data frame
 angle_df <- data.frame(
   ID = centroid_neg$ID,
@@ -1150,17 +1220,16 @@ mean_delta_pos <- colMeans(delta_pos)
 
 group_dot  <- sum(mean_delta_neg * mean_delta_pos)
 group_norm <- sqrt(sum(mean_delta_neg^2)) * sqrt(sum(mean_delta_pos^2))
-
 group_angle <- acos(group_dot / group_norm) * (180 / pi)
 
 t_test <- t.test(angle_df$Angle_Pos_Neg, mu = 0)
-
 cat("Group-level angle (Pos vs. Neg):", round(group_angle, 2), "degrees\n")
 cat("Mean individual angle:", round(mean(angle_df$Angle_Pos_Neg), 2), "degrees\n")
 cat("t =", round(t_test$statistic, 3), 
     ", p =", format.pval(t_test$p.value, digits = 3), 
     ", N =", nrow(angle_df), "\n")
 
+## ---------------------------------------------------------------------------------------------------------------------
 angle_graph <- ggplot(angle_df, aes(x = Angle_Pos_Neg)) +
   geom_density(fill = "#0c60ac", alpha = 0.4) +
   geom_vline(xintercept = mean(angle_df$Angle_Pos_Neg), linetype = "dashed", color = "black") +
@@ -1168,43 +1237,50 @@ angle_graph <- ggplot(angle_df, aes(x = Angle_Pos_Neg)) +
   labs(title = "Distribution of Angles Between Positive and Negative Displacements",
        x = "Angle (degrees)", y = "Density") +
   theme_minimal()
-
 ggsave(
-  filename = file.path("results","angle_graph.svg"),
+  filename = file.path(results_path,"angle_graph.svg"),
   plot     = angle_graph,   
   units    = "mm",
   dpi      = 300
 )
 
-# Components driving the divergence
 
+## ---------------------------------------------------------------------------------------------------------------------
 # Step 1: Difference between pos and neg deltas
 delta_diff <- delta_pos[, 1:5] - delta_neg[, 1:5]
 delta_diff <- delta_diff[complete.cases(delta_diff), ]  # remove any NAs
 
+## ---------------------------------------------------------------------------------------------------------------------
 # Step 2: Compute mean, SD, and t-tests for each component
 means <- colMeans(delta_diff)
 sds   <- apply(delta_diff, 2, sd)
-t_res <- map_dfr(delta_diff, ~ broom::tidy(t.test(.x, mu = 0)), .id = "Component")
+t_res <- map_dfr(delta_diff, ~ tidy(t.test(.x, mu = 0)), .id = "Component")
 
+## ---------------------------------------------------------------------------------------------------------------------
 # Step 3: Assemble into summary table
 divergence_by_component <- tibble(
   Component  = names(means),
   Mean_Diff  = means,
   Std_Diff   = sds
-) %>%
-  left_join(t_res %>% dplyr::select(Component, statistic, p.value), by = "Component") %>%
-  rename(t_value = statistic, p_value = p.value) %>%
+) |>
+  left_join(t_res |> dplyr::select(Component, statistic, p.value), by = "Component") |>
+  rename(t_value = statistic, p_value = p.value) |>
   arrange(p_value) 
 
+
+## ---------------------------------------------------------------------------------------------------------------------
 # View table
 divergence_by_component |> mutate(across(where(is.numeric), ~round(., 3)),
                                   p_fdr = p.adjust(p_value, method = "fdr")) 
 
-# Step 1: Compute means of displacement vectors
+
+## ---------------------------------------------------------------------------------------------------------------------
+#Step 1: Compute means of displacement vectors
 mean_delta_pos <- colMeans(delta_pos[, 1:5])
 mean_delta_neg <- colMeans(delta_neg[, 1:5])
 
+
+## ---------------------------------------------------------------------------------------------------------------------
 # Step 2: Create human-readable labels
 labels <- c(
   "Component_1_z" = "Negative Intrusive Thought",
@@ -1214,6 +1290,8 @@ labels <- c(
   "Component_5_z" = "Modality"
 )
 
+
+## ---------------------------------------------------------------------------------------------------------------------
 # Step 3: Assemble into summary table
 direction_summary <- tibble(
   Component = names(mean_delta_pos),
@@ -1222,6 +1300,8 @@ direction_summary <- tibble(
   Mean_Neg_Displacement = mean_delta_neg
 )
 
+
+## ---------------------------------------------------------------------------------------------------------------------
 # View table
 print(direction_summary)
 
@@ -1230,28 +1310,41 @@ direction_radar <- direction_summary |>
   pivot_longer(cols = starts_with("Mean_"), names_to = "Condition", values_to = "Value") |>
   pivot_wider(names_from = Label, values_from = Value)
 
+
+## ---------------------------------------------------------------------------------------------------------------------
 # Create the max and min rows as one-row data frames
 max_row <- as.data.frame(matrix(1, nrow = 1, ncol = ncol(direction_radar)))
 min_row <- as.data.frame(matrix(-1, nrow = 1, ncol = ncol(direction_radar)))
 
-# Copy column names from your main data
+
+## ---------------------------------------------------------------------------------------------------------------------
+#Copy column names from your main data
 colnames(max_row) <- colnames(direction_radar)
 max_row$Condition <- "Max"
 colnames(min_row) <- colnames(direction_radar)
 min_row$Condition <- "Min"
+
+
+## ---------------------------------------------------------------------------------------------------------------------
 # Bind all together
 radar_dir <- bind_rows(max_row, min_row, direction_radar)
+png(file.path(results_path,"radar_plot_displacement.png"), width = 1200, height = 1000, res = 300)
 
-png(file.path("results","radar_plot_displacement.png"), width = 1200, height = 1000, res = 300)
 
+## ---------------------------------------------------------------------------------------------------------------------
 # Expand plotting area: reduce margins
 op <- par(mar = c(1, 1, 1, 1))  # bottom, left, top, right
+
+
+## ---------------------------------------------------------------------------------------------------------------------
 # Set colors and labels
 colors_border <- c("#cc0000", "#0c60ac")  # Positive, Negative
 labels_order <- radar_dir$Condition
 
+
+## ---------------------------------------------------------------------------------------------------------------------
 # Plot
-radarchart(radar_dir|> dplyr::select(-Condition),
+fmsb::radarchart(radar_dir|> dplyr::select(-Condition),
            axistype = 1,
            seg = 4,
            pcol = colors_border,
@@ -1260,42 +1353,41 @@ radarchart(radar_dir|> dplyr::select(-Condition),
            cglcol = "grey", cglty = 1,
            axislabcol = "grey", caxislabels = c(-1, -0.5, 0, 0.5, 1), cglwd = 1,
            vlcex = 0.8)
-
 legend(x = "bottomright", title = "Condition", legend = c("Positive", "Negative"),
        bty = "n", pch = 20, col = colors_border, text.col = "black", cex = 1, pt.cex = 2)
 # Reset plotting parameters
-#dev.off()
 par(op)
-#' 
-#' ## Mood Model
-#' 
-## ----------------------------------------------------------------------------------------------------------------
+
+
+## ---------------------------------------------------------------------------------------------------------------------
 esm_traits_z <- esm_traits_z |>
   mutate(
     AGE_stnd = scale(AGE),
     GENDER = as_factor(GENDER)
   )
 
-#' ### Component 1
-#' 
-## ----------------------------------------------------------------------------------------------------------------
+
+## ---------------------------------------------------------------------------------------------------------------------
 mood_depression_mdl <- lme4::lmer(Component_1_z ~ Stimulus_Type * CESD_stnd  + AGE_stnd + GENDER + (Stimulus_Type|ID), data = esm_traits_z)
+
 summary(mood_depression_mdl)
 
 ci_dep_int_param <- parameters::parameters(mood_depression_mdl)
 ci_dep_int_param |> knitr::kable(digits = 3)
-#' 
-## ----------------------------------------------------------------------------------------------------------------
-#TODO
+
+
+## ---------------------------------------------------------------------------------------------------------------------
 cols <- c("Baseline" = "#595959", "pos" = "#cc0000", "neg" = "#0c60ac" )
+
 pred <- estimate_relation(mood_depression_mdl)
+
 depression_model_plot <- pred |> 
   ggplot(aes(x=CESD_stnd, y=Predicted)) +
   geom_point(data = esm_traits,
              aes(x = CESD_stnd, y = Component_1, color = Stimulus_Type),
              alpha = 0.25, size = 1.2, inherit.aes = FALSE, position = "jitter") +
   geom_ribbon(aes(fill=Stimulus_Type, ymin=CI_low, ymax=CI_high), alpha=0.1) +
-  geom_line(aes(color=Stimulus_Type), size =0.8, position = "dodge") + 
+  geom_line(aes(color=Stimulus_Type), linewidth =0.8, position = "dodge") + 
   labs( y="Negative Intrusive Thought scores", x="Depression scores (CESD)", fill="Condition") +
   scale_color_manual(aesthetics = c("colour", "fill"), labels = c("Default", "Positive", "Negative"), values = cols) +
   guides(color=guide_legend("Condition")) +
@@ -1305,7 +1397,6 @@ depression_model_plot <- pred |>
       panel.grid.minor     = element_blank(),
       axis.line            = element_line(color = "black", linewidth = 0.7),
       axis.ticks           = element_line(color = "black"),
-      
       # inside top-right   
       legend.position      = "top",
       legend.location = "panel",
@@ -1313,12 +1404,12 @@ depression_model_plot <- pred |>
       legend.text          = element_text(size = 18),
       legend.title = element_text(face = "bold"),
     )
+
 depression_model_plot
 
-#' 
-## ----------------------------------------------------------------------------------------------------------------
-ggsave(
-  filename = file.path("results","depression_int_c1.svg"),
+
+## ---------------------------------------------------------------------------------------------------------------------
+ggsave(file.path(results_path, "depression_int_c1.svg"),
   plot     = depression_model_plot,
   width    = 200,       # cm (1/3 of 84.1 cm)
   height   = 155,     # cm (aspect ratio 10:6)
@@ -1326,25 +1417,25 @@ ggsave(
   dpi      = 300
 )
 
-#' 
-## ----------------------------------------------------------------------------------------------------------------
+
+## ---------------------------------------------------------------------------------------------------------------------
 estimate_slopes(mood_depression_mdl, trend="CESD_stnd", by="Stimulus_Type")
 estimate_contrasts(mood_depression_mdl, contrast = "Stimulus_Type", by="CESD_stnd", length=3, p_adjust = "fdr") |> knitr::kable(digits = 3)
 
-#' 
-#' ## Cronback's alpha
-#' 
-## ----------------------------------------------------------------------------------------------------------------
-traits <- read.csv(file.path("results", "Combined_traits.csv"))|> 
+
+## ---------------------------------------------------------------------------------------------------------------------
+traits <- read.csv(file.path(dirname(getwd()),"data", "Combined_traits.csv"))|> 
   dplyr::mutate(ID = forcats::as_factor(ID))
 
-#' 
-## ----------------------------------------------------------------------------------------------------------------
+
+## ---------------------------------------------------------------------------------------------------------------------
 traits <- traits |>
   drop_na(c(24:63))
 a_CESD<- ltm::cronbach.alpha(traits[,24:43],standardized = TRUE, CI=T)
 CI_CESD <- a_CESD$ci
 
+
+## ---------------------------------------------------------------------------------------------------------------------
 # Create the table
 alpha_tbl <- data.frame(
   Questionnaire = c("CESD"),
@@ -1352,12 +1443,9 @@ alpha_tbl <- data.frame(
   Alpha = c(a_CESD$alpha),
   'Lower CI' = c(CI_CESD[1]), 
   'Upper CI'=c(CI_CESD[2])) |> rempsyc::nice_table()
-#flextable::save_as_docx(alpha_tbl, path = "alpha_tbl.docx")
 
-#' 
-#' ## Descriptive stats
-#' 
-## ----------------------------------------------------------------------------------------------------------------
+
+## ---------------------------------------------------------------------------------------------------------------------
 response_rate <- esm_traits_base |>
   mutate(
     Date = ymd_hms(Date),  
@@ -1366,8 +1454,8 @@ response_rate <- esm_traits_base |>
   group_by(ID, Day) |>
   summarise(n_entries = n(), .groups = "drop")
 
-#' 
-## ----------------------------------------------------------------------------------------------------------------
+
+## ---------------------------------------------------------------------------------------------------------------------
 rr_stats <- response_rate |>
   group_by(ID) |>
   summarise(mean_per_day = mean(n_entries)) 
@@ -1375,8 +1463,8 @@ mean(rr_stats$mean_per_day)
 sd(rr_stats$mean_per_day)
 range(response_rate$n_entries)
 
-#' 
-## ----------------------------------------------------------------------------------------------------------------
+
+## ---------------------------------------------------------------------------------------------------------------------
 rr_days <- response_rate |>
   group_by(ID) |>
   summarise(n_days = n_distinct(Day), .groups = "drop")
@@ -1384,17 +1472,17 @@ mean(rr_days$n_days)
 sd(rr_days$n_days)
 range(rr_days$n_days)
 
-#' 
-## ----------------------------------------------------------------------------------------------------------------
-prop_6days <- rr_days %>%
+
+## ---------------------------------------------------------------------------------------------------------------------
+prop_6days <- rr_days |>
   summarise(
     total_participants = n(),
     at_least_6_days = sum(n_days >= 6),
     proportion = at_least_6_days / total_participants
   )
 
-#' 
-## ----------------------------------------------------------------------------------------------------------------
+
+## ---------------------------------------------------------------------------------------------------------------------
 rr_total <- esm_traits_base |>
   group_by(ID) |>
   summarise(total_responses = n(), .groups = "drop")
@@ -1402,25 +1490,25 @@ mean(rr_total$total_responses)
 sd(rr_total$total_responses)
 range(rr_total$total_responses)
 
-#' 
-## ----------------------------------------------------------------------------------------------------------------
-nrow(esm_traits_base) / (n_unique(esm_traits_base$ID)*42)
 
-#' 
-## ----------------------------------------------------------------------------------------------------------------
+## ---------------------------------------------------------------------------------------------------------------------
+nrow(esm_traits_base) / (n_distinct(esm_traits_base$ID)*42)
+
+
+## ---------------------------------------------------------------------------------------------------------------------
 ggplot(cesd_by_id, aes(CESD)) +
   geom_histogram(binwidth = 1) +
   labs(x = "Depression", y = "Frequency") +
   theme_minimal()
 
-#' 
-## ----------------------------------------------------------------------------------------------------------------
+
+## ---------------------------------------------------------------------------------------------------------------------
 cesd_dis <- cesd_by_id |>
-  describe_distribution()
+  datawizard::describe_distribution()
 cesd_dis
 
-#' 
-## ----------------------------------------------------------------------------------------------------------------
+
+## ---------------------------------------------------------------------------------------------------------------------
 traits_summary <- esm_traits_base |>
   dplyr::distinct(ID, .keep_all = TRUE) |>
   dplyr::select(AGE, GENDER, CESD) |>
@@ -1433,30 +1521,34 @@ traits_summary <- esm_traits_base |>
   ) 
 traits_summary
 flextable_summary <- gtsummary::as_flex_table(traits_summary)
-flextable::save_as_rtf(flextable_summary, path = file.path("results","distr_tbl.rtf"))
+flextable::save_as_rtf(flextable_summary, path = file.path(results_path,"distr_tbl.rtf"))
 
-#' 
-## ----------------------------------------------------------------------------------------------------------------
-participant_counts_only <- participant_counts %>%
+
+## ---------------------------------------------------------------------------------------------------------------------
+participant_counts_only <- participant_counts |>
   left_join(cesd_by_id, by = "ID")|>
   mutate(CESD_th = forcats::fct_relevel(CESD_th, "No", "Yes"),
          C1_prop = forcats::fct_relevel(C1_prop, "Low", "High"),
          ID = forcats::as_factor(ID) |> forcats::fct_drop())
 
+
+## ---------------------------------------------------------------------------------------------------------------------
 # 1. Count unique participants per group
-counts_wide <- participant_counts_only %>%
-  dplyr::distinct(ID, CESD_th) %>%
-  dplyr::count(CESD_th) %>%
+counts_wide <- participant_counts_only |>
+  dplyr::distinct(ID, CESD_th) |>
+  dplyr::count(CESD_th) |>
   tidyr::pivot_wider(
     names_from  = CESD_th,
     values_from = n,
     names_prefix = "n_"
-  ) %>%
+  ) |>
   mutate(n_Overall = n_No + n_Yes)
 
+
+## ---------------------------------------------------------------------------------------------------------------------
 # 2. Get CESD summary stats
-cesd_summary <- participant_counts_only %>%
-  distinct(ID, CESD, CESD_th) %>%
+cesd_summary <- participant_counts_only |>
+  distinct(ID, CESD, CESD_th) |>
   summarise(
     CESD_Overall_Mean = mean(CESD, na.rm = TRUE),
     CESD_Overall_SD   = sd(CESD, na.rm = TRUE),
@@ -1466,9 +1558,11 @@ cesd_summary <- participant_counts_only %>%
     CESD_Yes_SD       = sd(CESD[CESD_th == "Yes"], na.rm = TRUE)
   )
 
+
+## ---------------------------------------------------------------------------------------------------------------------
 # 3. Proportion summary per C1_prop level
-prop_summary <- participant_counts_only %>%
-  group_by(C1_prop) %>%
+prop_summary <- participant_counts_only |>
+  group_by(C1_prop) |>
   summarise(
     mean_Overall = mean(prop, na.rm = TRUE),
     mean_No      = mean(prop[CESD_th == "No"],  na.rm = TRUE),
@@ -1476,48 +1570,52 @@ prop_summary <- participant_counts_only %>%
     .groups = "drop"
   )
 
+
+## ---------------------------------------------------------------------------------------------------------------------
 # 1. CESD summary — reshape to match structure
-cesd_summary_long <- cesd_summary %>%
+cesd_summary_long <- cesd_summary |>
   mutate(
     Measure        = "CESD",
     C1_prop_Level  = ""
-  ) %>%
-  select(
+  ) |>
+  dplyr::select(
     Measure, C1_prop_Level,
     Overall = CESD_Overall_Mean,
     No      = CESD_No_Mean,
     Yes     = CESD_Yes_Mean
   )
 
+
+## ---------------------------------------------------------------------------------------------------------------------
 # 2. prop_summary — reshape to same format
-prop_summary_long <- prop_summary %>%
+prop_summary_long <- prop_summary |>
   mutate(
     Measure = "C1_prop"
-  ) %>%
-  rename(C1_prop_Level = C1_prop) %>%
-  select(Measure, C1_prop_Level, 
+  ) |>
+  rename(C1_prop_Level = C1_prop) |>
+  dplyr::select(Measure, C1_prop_Level, 
          Overall = mean_Overall,
          No      = mean_No,
          Yes     = mean_Yes)
 
+
+## ---------------------------------------------------------------------------------------------------------------------
 # 3. Bind both summaries
 summary_combined <- bind_rows(cesd_summary_long, prop_summary_long)
 
 
-#' 
-## ----------------------------------------------------------------------------------------------------------------
+## ---------------------------------------------------------------------------------------------------------------------
 # 4. Optional: round values
-summary_combined <- summary_combined %>%
+summary_combined <- summary_combined |>
   mutate(across(c(Overall, No, Yes), ~ round(.x, 2)))
-
 gt_summary <- gt::gt(summary_combined) |>
   gt::tab_spanner("Depression", columns = c(No, Yes))|>
   gt::cols_label(Measure = "Characteristic", 
                  C1_prop_Level = "")
 gt_summary
 
-#' 
-## ----------------------------------------------------------------------------------------------------------------
+
+## ---------------------------------------------------------------------------------------------------------------------
 freq_summary <- esm_traits_base |>
   group_by(ID) |>
   gtsummary::tbl_summary(by = "CESD_th", include = c(CESD, C1_prop, Component_1),
@@ -1529,25 +1627,24 @@ freq_summary <- esm_traits_base |>
     missing = "no"
   ) |> gtsummary::add_overall() |>
   gtsummary::modify_spanning_header(c("stat_1", "stat_2") ~ "**Depression Group**") 
-freq_summary
-flextable_summary <- gtsummary::as_flex_table(freq_summary)
-flextable::save_as_rtf(flextable_summary, path = file.path("results", "freq_tbl.rtf"))
 
-#' 
-## ----------------------------------------------------------------------------------------------------------------
-esm_traits %>%
-  group_by(ID) %>%
-  summarise(age = first(AGE)) %>%
+freq_summary
+
+flextable_summary <- gtsummary::as_flex_table(freq_summary)
+flextable::save_as_rtf(flextable_summary, path = file.path(results_path, "freq_tbl.rtf"))
+
+
+## ---------------------------------------------------------------------------------------------------------------------
+esm_traits |>
+  group_by(ID) |>
+  summarise(age = first(AGE)) |>
   summarise(mean_age = mean(age, na.rm = TRUE),
             sd_age = sd(age, na.rm = TRUE))
 
-#' 
-## ----------------------------------------------------------------------------------------------------------------
+
+## ---------------------------------------------------------------------------------------------------------------------
 esm_traits_base |> 
   dplyr::group_by(ID) |>
   dplyr::summarise(count = n()) |>
-  describe_distribution()
-
-#' 
-
+  datawizard::describe_distribution()
 

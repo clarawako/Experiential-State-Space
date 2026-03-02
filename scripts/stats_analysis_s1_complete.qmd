@@ -18,27 +18,29 @@ output:
   output-file: stats_analysis_s1_complete.html
 ---
 ```{r}
+# ---- Packages ----
+# Data wrangling + plotting
 library(tidyverse)
-library(easystats)
+
+# Mixed models
 library(lme4)
-library(dplyr)
-library(glmmTMB) # for beta and binomial regressions
-library(ggeffects)
-library(psych)
-library(influence.ME)
-library(ggside)
-library(matrixStats)  # for rowMedians
-library(pdist)        # for distance matrices
-library(pracma) #for geometric median
-library(tidyr)
-library(depmixS4) # for HMMs
+library(glmmTMB)
+library(modelbased)
+
+# # Model summaries / tidying / prediction
 library(broom)
-library(mutoss)
-library(clue)
-library(cluster) # for kmedoids
-library(concaveman)
-#library(factoextra)
-library(fmsb) # for radar plot
+library(broom.mixed)
+
+# HMMs + matching
+library(depmixS4)
+
+# # Distances / geometry / clustering / visualisation (load only if used)
+library(pracma)        # geo_median
+library(cluster)       # pam() 
+library(concaveman)    # concave hull
+
+# Plot extras
+library(ggside)
 ```
 # Custom functions
 ## HMM fitting
@@ -404,7 +406,7 @@ perm_df <- data.frame(perm_diff = perm_diffs)
 # Make the plot
 permutation_plot <- ggplot(perm_df, aes(x = perm_diff)) +
   geom_histogram(bins = 50, fill = "grey80", color = "black") +
-  geom_vline(xintercept = observed_diff, color = "#990000", size = 1.2) +
+  geom_vline(xintercept = observed_diff, color = "#990000", linewidth = 1.2) +
   annotate("text",
            x = Inf,
            y = Inf,
@@ -619,8 +621,7 @@ esm_hmm <- esm_centroids |>
 ```
 
 ```{r}
-# ---- Fit HMMs across K values and random seeds ----
-
+# Fit HMMs across K values and random seeds 
 K_values <- 2:5
 seeds    <- 1:20
 
@@ -906,7 +907,7 @@ transition_sym_stats <- tpm_pair_avg |>
   nest() |>
   mutate(
     model = map(data, ~ lm(prob_avg ~ CESD_stnd + AGE_stnd + GENDER, data = .x)),
-    tidy  = map(model, ~ broom::tidy(.x, conf.int = TRUE))
+    tidy  = map(model, ~ tidy(.x, conf.int = TRUE))
   ) |>
   unnest(tidy) |>
   group_by(term) |>
@@ -973,7 +974,7 @@ transition_sym_stats_no_self <- tpm_pair_no_self |>
   nest() |>
   mutate(
     model = map(data, ~ lm(prob_avg ~ CESD_stnd + AGE_stnd + GENDER, data = .x)),
-    tidy  = map(model, ~ broom::tidy(.x, conf.int = TRUE))
+    tidy  = map(model, ~ tidy(.x, conf.int = TRUE))
   ) |>
   unnest(tidy) |>
   group_by(term) |>
@@ -1007,7 +1008,7 @@ fo_beta_results <- fractional_occupancy |>
     model = map(data, ~ glmmTMB(FO ~ CESD_stnd ,
                                 data = .x,
                                 family = ordbeta(link = "logit"))),
-    tidy = map(model, ~ broom.mixed::tidy(.x, conf.int = TRUE))
+    tidy = map(model, ~ tidy(.x, conf.int = TRUE))
   ) |>
   unnest(tidy) |>
   mutate(term = as.character(term)) |>
@@ -1302,7 +1303,7 @@ delta_diff <- delta_diff[complete.cases(delta_diff), ]  # remove any NAs
 # Step 2: Compute mean, SD, and t-tests for each component
 means <- colMeans(delta_diff)
 sds   <- apply(delta_diff, 2, sd)
-t_res <- map_dfr(delta_diff, ~ broom::tidy(t.test(.x, mu = 0)), .id = "Component")
+t_res <- map_dfr(delta_diff, ~ tidy(t.test(.x, mu = 0)), .id = "Component")
 ```
 ```{r}
 # Step 3: Assemble into summary table
@@ -1392,7 +1393,7 @@ labels_order <- radar_dir$Condition
 
 ```{r}
 # Plot
-radarchart(radar_dir|> dplyr::select(-Condition),
+fmsb::radarchart(radar_dir|> dplyr::select(-Condition),
            axistype = 1,
            seg = 4,
            pcol = colors_border,
@@ -1439,7 +1440,7 @@ depression_model_plot <- pred |>
              aes(x = CESD_stnd, y = Component_1, color = Stimulus_Type),
              alpha = 0.25, size = 1.2, inherit.aes = FALSE, position = "jitter") +
   geom_ribbon(aes(fill=Stimulus_Type, ymin=CI_low, ymax=CI_high), alpha=0.1) +
-  geom_line(aes(color=Stimulus_Type), size =0.8, position = "dodge") + 
+  geom_line(aes(color=Stimulus_Type), linewidth =0.8, position = "dodge") + 
   labs( y="Negative Intrusive Thought scores", x="Depression scores (CESD)", fill="Condition") +
   scale_color_manual(aesthetics = c("colour", "fill"), labels = c("Default", "Positive", "Negative"), values = cols) +
   guides(color=guide_legend("Condition")) +
@@ -1548,7 +1549,7 @@ range(rr_total$total_responses)
 ```
 
 ```{r}
-nrow(esm_traits_base) / (n_unique(esm_traits_base$ID)*42)
+nrow(esm_traits_base) / (n_distinct(esm_traits_base$ID)*42)
 ```
 
 ```{r}
@@ -1560,7 +1561,7 @@ ggplot(cesd_by_id, aes(CESD)) +
 
 ```{r}
 cesd_dis <- cesd_by_id |>
-  describe_distribution()
+  datawizard::describe_distribution()
 cesd_dis
 ```
 
@@ -1702,7 +1703,7 @@ esm_traits |>
 esm_traits_base |> 
   dplyr::group_by(ID) |>
   dplyr::summarise(count = n()) |>
-  describe_distribution()
+  datawizard::describe_distribution()
 ```
 
 
