@@ -16,6 +16,9 @@ data/
 # Results
 results/
 
+# Old script
+stats_analysiss1_complete.R
+
 # OS files
 .DS_Store
 Thumbs.db
