@@ -17,7 +17,7 @@ data/
 results/
 
 # Old script
-stats_analysis1_complete.R
+stats_analysis_s1_complete.R
 
 # OS files
 .DS_Store
