@@ -201,8 +201,7 @@ demo <- esm_traits |>
   left_join(
     esm_traits |>
       group_by(Dataset, ID) |>
-      summarise(AGE = first(AGE), GENDER = first(GENDER), CESD = first(CESD),
-                .groups = "drop"),
+      summarise(AGE = first(AGE), GENDER = first(GENDER), CESD = first(CESD), .groups = "drop"),
     by = c("Dataset", "ID")
   )
 ```
@@ -350,12 +349,12 @@ group_by(Stimulus_Type) |>
 
 affective_test <- lme4::lmer(Positive_stnd ~ Stimulus_Type + (Stimulus_Type|ID), data = esm_traits_z)
 
-parameters::parameters(affective_test, ci_method = "satterthwaite")
+parameters::parameters(affective_test)
 ```
 ```{r}
 affective_test_dep <- lme4::lmer(Positive_stnd ~ Stimulus_Type*CESD_stnd + (Stimulus_Type|ID), data = esm_traits_z)
 
-parameters::parameters(affective_test_dep, ci_method = "satterthwaite")
+parameters::parameters(affective_test_dep)
 ```
 # Establish default thought patterns: calculate for each participant the geometric median of their observations
 
@@ -550,7 +549,7 @@ permutation_plot <- ggplot(perm_df, aes(x = perm_diff)) +
 ## Negative Intrusive thought modeled from depression levels
 dep_c1_lm <- lme4::lmer(Component_1_z ~ CESD_stnd + AGE_stnd + GENDER + (1|ID), data = esm_traits_base)
 summary(dep_c1_lm)
-parameters::parameters(dep_c1_lm, ci_method = "satterthwaite")|> knitr::kable(digits = 3)
+parameters::parameters(dep_c1_lm)|> knitr::kable(digits = 3)
 
 anova_c1<- car::Anova(dep_c1_lm, type = 3, test.statistic = "F") 
 anova_tbl <- anova_c1 |> 
@@ -666,7 +665,7 @@ or_bi |> knitr::kable(digits = 3)
 binomial_plot <-ggplot(esm_binomial, aes(x = CESD_stnd, y = high / total)) +
   geom_point(color = "black", alpha = 0.6, size = 1.5) +
   stat_smooth(method = "glm", 
-              method.args = list(family = "binomial"), 
+              method.args = list(family = "quasibinomial"), 
               se = TRUE, 
               color = "#990000") +
   labs(
@@ -840,14 +839,14 @@ p_dep
 ```{r}
 radius_mixed <- lmer(Radius_geom ~ Stimulus_Type + AGE_stnd + GENDER +  (Stimulus_Type| ID), data = esm_centroids)
 
-parameters::parameters(radius_mixed, p_adjust = "fdr", ci_method = "satterthwaite")
+parameters::parameters(radius_mixed, p_adjust = "fdr")
 ```
 
 ```{r}
 # Effect sizes
 sd_radius <- sd(esm_centroids$Radius_geom, na.rm = TRUE)
 
-parameters::parameters(radius_mixed, ci_method = "satterthwaite") |>
+parameters::parameters(radius_mixed) |>
   as.data.frame() |>
   dplyr::filter(grepl("Stimulus_Type", Parameter)) |>
   dplyr::mutate(d       = Coefficient / sd_radius,
@@ -928,13 +927,13 @@ loo_df <- loo_df |>
 ```{r}
 radius_mixed_loo <- lmer(Radius_geom ~ Stimulus_Type + AGE_stnd + GENDER + (Stimulus_Type| ID), data = loo_df)
 
-parameters::parameters(radius_mixed_loo, p_adjust = "fdr", ci_method = "satterthwaite")
+parameters::parameters(radius_mixed_loo, p_adjust = "fdr")
 ```
 ```{r}
 # Effect sizes
 sd_radius <- sd(loo_df$Radius_geom, na.rm = TRUE)
 
-parameters::parameters(radius_mixed_loo, ci_method = "satterthwaite") |>
+parameters::parameters(radius_mixed_loo) |>
   as.data.frame() |>
   dplyr::filter(grepl("Stimulus_Type", Parameter)) |>
   dplyr::mutate(d       = Coefficient / sd_radius,
@@ -1218,7 +1217,7 @@ par(op)
 ```{r}
 mood_depression_mdl <- lmerTest::lmer(Component_1_z ~ Stimulus_Type * CESD_stnd + AGE_stnd + GENDER  + (Stimulus_Type|ID), data = esm_traits_z)
 
-ci_dep_int_param <- parameters::parameters(mood_depression_mdl, ci_method = "satterthwaite")
+ci_dep_int_param <- parameters::parameters(mood_depression_mdl)
 ci_dep_int_param |> knitr::kable(digits = 3)
 ```
 
@@ -1270,11 +1269,10 @@ ggsave(file.path(results_path, "depression_int_c1.svg"),
 ```
 
 ```{r}
-ec <- estimate_contrasts(mood_depression_mdl, contrast = "Stimulus_Type", by="CESD_stnd", p_adjust = "fdr", length=2) 
+ec <- estimate_contrasts(mood_depression_mdl, contrast = "Stimulus_Type", by="CESD_stnd", p_adjust = "fdr", length=3) 
 
-ec |> knitr::kable(digits = 3)
+ec |> knitr::kable(digits = 4)
 ```
-
 
 ```{r}
 # Effect size for factor contrasts
@@ -1495,6 +1493,10 @@ for (i in 1:n_perm) {
 p_value_cent <- mean(perm_diffs_cent >= observed_diff_cent)
 perm_cent_df <- data.frame(perm_diff_cent = perm_diffs_cent)
 ```
+```{r}
+observed_diff_cent
+p_value_cent
+```
 
 ```{r}
 # Make the plot
@@ -1686,7 +1688,7 @@ esm_traits_base <- esm_traits_base |>
 ```{r}
 c1_dep_check <- lme4::lmer(Component_1_z ~ CESD_within + CESD_between + AGE_stnd + GENDER + (1 | ID), data = esm_traits_base)
 
-parameters::parameters(c1_dep_check, ci_method = "satterthwaite")
+parameters::parameters(c1_dep_check)
 ```
 ```{r}
 esm_binomial <- esm_binomial|>
@@ -1737,5 +1739,5 @@ esm_traits_z <- esm_traits_z |>
 c1_dep_check <- lme4::lmer(Component_1_z ~ Stimulus_Type * CESD_within + CESD_between +
                  AGE_stnd + GENDER + (Stimulus_Type | ID), data = esm_traits_z)
 
-parameters::parameters(c1_dep_check, ci_method = "satterthwaite")
+parameters::parameters(c1_dep_check)
 ```
