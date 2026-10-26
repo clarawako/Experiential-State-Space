@@ -241,7 +241,7 @@ bind_rows(demo_table, total_row) |> knitr::kable()
 summary(aov(CESD ~ Dataset, data = demo))
 summary(aov(AGE ~ Dataset, data = demo))
 summary(aov(daily ~ Dataset, data = demo))
-chisq.test(table(demo$Dataset, demo$GENDER), simulate.p.value = TRUE)
+fisher.test(table(demo$Dataset, demo$GENDER))
 ```
 
 ```{r}
@@ -791,7 +791,7 @@ hp_clusters <-ggplot(medoid_profiles, aes(component, cluster, fill = value)) +
 hp_clusters
 ```
 ```{r}
-ggsave(filename = file.path(results_path, "heatmap_clusters.png"),
+ggsave(filename = file.path(results_path, "heatmap_clusters.svg"),
   plot     = hp_clusters ,
   width    = 200,       # cm (1/3 of 84.1 cm)
   height   = 150,     # cm (aspect ratio 10:6)
@@ -1215,7 +1215,7 @@ par(op)
 ## Component 1
 
 ```{r}
-mood_depression_mdl <- lmerTest::lmer(Component_1_z ~ Stimulus_Type * CESD_stnd + AGE_stnd + GENDER  + (Stimulus_Type|ID), data = esm_traits_z)
+mood_depression_mdl <- lme4::lmer(Component_1_z ~ Stimulus_Type * CESD_stnd + AGE_stnd + GENDER  + (Stimulus_Type|ID), data = esm_traits_z)
 
 ci_dep_int_param <- parameters::parameters(mood_depression_mdl)
 ci_dep_int_param |> knitr::kable(digits = 3)
@@ -1343,7 +1343,9 @@ L_cat_rot <- unclass(rot$loadings)
 # Check eigenvalues
 cat5$evals[1:18]
 ```
+
 ### Compare loadings
+
 ```{r}
 # Load PCA loadings from original solution
 pca_loadings  <- read.csv(file.path(dirname(getwd()), "data", "pca_loadings_with_task.csv"), row.names = 1) 
@@ -1366,6 +1368,7 @@ C |> knitr::kable(digits = 3)
 cosines <- svd(t(qr.Q(qr(pca_loadings_og))) %*% qr.Q(qr(cat_pca_loadings)))$d
 round(cosines, 3)
 ```
+
 ## Similarity analysis of mean centered PCA
 
 ```{r}
@@ -1412,7 +1415,7 @@ within_similarity_cent_df <- data.frame(ID = character(), within_similarity_cent
 
 ```{r}
 # Loop over each participant ID
-for (id in participant_ids) {
+for (id in participant_ids_cent) {
   # Subset data for the current participant
   participant_data <- pca_centered |>
     dplyr::filter(ID == id) |>
@@ -1494,6 +1497,8 @@ p_value_cent <- mean(perm_diffs_cent >= observed_diff_cent)
 perm_cent_df <- data.frame(perm_diff_cent = perm_diffs_cent)
 ```
 ```{r}
+mean(within_z_cent)
+mean(between_z_cent)
 observed_diff_cent
 p_value_cent
 ```
@@ -1529,7 +1534,7 @@ permutation_plot <- ggplot(perm_cent_df, aes(x = perm_diff_cent)) +
     legend.spacing.y = unit(0,"cm"),
   ) 
 ggsave(
-   filename = file.path(results_path, "permutation_plot_centered_pca.svg"),
+   filename = file.path(results_path, "permutation_plot_centered_pca.png"),
    plot     = permutation_plot,
    width    = 200,       # cm (1/3 of 84.1 cm)
    height   = 150,     # cm (aspect ratio 10:6)
@@ -1567,6 +1572,7 @@ icc_comp <- sapply(comps, function(v) {
 })
 round(icc_comp, 3)
 ```
+
 # PCA space stability
 
 ```{r}

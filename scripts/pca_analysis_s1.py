@@ -227,4 +227,102 @@ if save_results in ['yes', 'y']:
     name_proj = input("What do you want to name your projected Session 2 output? Words split by _").strip().lower()  
     mood_projected_full.to_csv(f"{ROOT}/data/projected_session_2_scores_{name_proj}.csv")
 
+# Robustness check
+# Person mean center the matrix, rerun the PCA on the person mean centered data, then project the original scores into this new PCA space
 
+# Person meanc center the matrix
+dimensions = selected_columns.drop("ID").to_list()
+
+X = esm_filtered[dimensions]
+esm_mean_cent = X - esm_filtered.groupby("ID").transform("mean")
+
+# Check
+print(esm_mean_cent.groupby(esm_filtered['ID']).mean().abs().max().max())   # ~0
+print(esm_mean_cent.shape == X.shape)                                        # True
+
+# Standardise to match original pipeline
+scaler_cent = StandardScaler()
+esm_mean_cent_z = scaler_cent.fit_transform(esm_mean_cent)
+
+# PCA with varimax rotation, on the person mean centered data
+# Apply varimax or not
+# Find the number of components to extract
+components = input("Do you want to extract a specific number of components? (yes/no): ").strip().lower()
+if components in ['yes', 'y']:
+    number = input("How many? Please use a numerical value").strip() #Later add more conditions to this, will suffice for now TO DO
+    n_components_cent = int(number)
+else:
+    fa_num_cent = FactorAnalyzer(rotation= None, n_factors=esm_mean_cent.shape[1], method='principal') #Extract all then only keep those that have an eigenvalue > 1
+    fa_num_cent.fit(esm_mean_cent_z)
+    eigenvalues_cent, fa_eigvalues_cent = fa_num_cent.get_eigenvalues()
+    n_components_cent = np.sum(eigenvalues_cent > 1)
+
+apply_rotation = input("Do you want to apply Varimax rotation? (yes/no): ").strip().lower()
+if apply_rotation in ['yes', 'y']:
+    rotation = 'varimax'
+else:
+    rotation = None
+
+# Compute the PCA, method = principal is hard coded
+fa_cent = FactorAnalyzer(rotation= rotation, n_factors=n_components_cent, method='principal') 
+fa_cent.fit(esm_mean_cent_z)
+eigenvalues_cent, fa_eigvalues_cent = fa_cent.get_eigenvalues()
+
+# Print number of components with eigenvalue larger than 1
+print(f"Number of components extracted: {n_components_cent}")
+# Scree plot
+plt.figure(figsize=(8, 5))
+plt.plot(range(1, len(eigenvalues_cent) + 1), eigenvalues_cent, marker='o', linestyle='-', color='b')
+plt.title("Scree Plot")
+plt.xlabel("Principal Component")
+plt.ylabel("Eigenvalue")
+plt.xticks(range(1, len(eigenvalues_cent) + 1))  # Ensure each factor index is labeled
+plt.grid()
+
+plt.show()
+
+# Retrieve the factor loadings
+loadings_cent = pd.DataFrame(fa_cent.loadings_, columns=[f"Component {x+1}" for x in range(n_components_cent)], index=dimensions)
+if rotation:
+    print("\nRotated Factor Loadings (Varimax):")
+else:
+    print("\nUnrotated Factor Loadings:")
+print(loadings_cent)
+
+variance_cent, proportional_var_cent, cummulative_var_cent = fa_cent.get_factor_variance()
+
+# Project the whole dataset into the new space
+scores_cent = fa_cent.transform(esm_proj)
+pca_scores_cent = pd.DataFrame(scores_cent, columns=[f"Component {x+1}" for x in range(n_components_cent)], index = esm_thoughts['ID']) # Shoud be the scores in the new space
+pca_scores_cent.to_csv(f"{ROOT}/data/pca_scores_centred.csv", index= True)
+
+print("Variance explained by each factor:", np.round(variance_cent, 2)) #needs to be printed in a nicer way, will do for now TO DO
+print("Proportion of variance explained by each factor:", np.round(proportional_var_cent, 3))
+print("Cumulative variance explained:", np.round(cummulative_var_cent, 3))
+
+# Compare original PCA loadings to new ones
+print(list(loadings.index) == list(loadings_cent.index))
+loadings.shape, loadings_cent.shape
+
+def congruence(A, B):
+    A = np.asarray(A, dtype=float)
+    B = np.asarray(B, dtype=float)
+    num = A.T @ B
+    den = np.sqrt(np.outer((A**2).sum(0), (B**2).sum(0)))
+    return num / den
+
+C = congruence(loadings, loadings_cent)
+np.round(C, 2)
+
+match = np.abs(C).argmax(axis=1)
+assert len(set(match)) == 5, "components competing for the same match"
+
+signs = np.sign(C[np.arange(5), match])
+C_aligned = C[:, match] * signs
+np.round(C_aligned, 2)
+
+congruence_matrix =pd.DataFrame(np.round(C_aligned, 2),
+             index=loadings.columns,
+             columns=[f"centred_{loadings_cent.columns[i]}" for i in match])
+
+print(congruence_matrix)
